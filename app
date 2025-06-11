@@ -201,9 +201,9 @@ global_data = {
     'ps': None,
     'ps1': None,
     'pseq_rel': None,
-    'otu_rel': None,
+    'asv_rel': None,
     'meta_rel': None,
-    'otu_absolute': None,
+    'asv_absolute': None,
     'meta_absolute': None,
     'indval_table': None,
     'tax_df': None,
@@ -317,15 +317,15 @@ def ai_analyze_metadata(metadata):
         return None
     return None
 
-def ai_analyze_pca_pcoa(otu, ordination_scores):
+def ai_analyze_pca_pcoa(asv, ordination_scores):
     if not ai_available:
         return None
     # For sample data, return hardcoded values
-    if otu.index[0] == 'ASV1':
+    if asv.index[0] == 'ASV1':
         return {'top_asvs': '20,50,100', 'pval_threshold': 0.005, 'contrib_threshold': 0.65}
-    otu_sums = otu.sum()
+    asv_sums = asv.sum()
     prompt = f"""
-    Given ASV abundance sums (mean: {otu_sums.mean()}, median: {otu_sums.median()})
+    Given ASV abundance sums (mean: {asv_sums.mean()}, median: {asv_sums.median()})
     and ordination variance explained (first two axes: {ordination_scores[:2]})
     suggest top ASVs for PCA and thresholds for PCoA vectors.
     Return: {{'top_asvs': 'X,Y,Z', 'pval_threshold': A, 'contrib_threshold': B}}
@@ -423,7 +423,7 @@ def generate_pdf_report(seqtab, ps1_meta, pcoa_scores, pca_result, ps1_melt, tre
         elements.append(Paragraph(f"{interpretations}", styles['BodyText']))
         
         elements.append(Paragraph("Output Files", styles['Heading2']))
-        elements.append(Paragraph(f"ASV Table: {os.path.join(output_dir, 'microbiome_ai_16s_otu.csv')}", styles['BodyText']))
+        elements.append(Paragraph(f"ASV Table: {os.path.join(output_dir, 'microbiome_ai_16s_asv.csv')}", styles['BodyText']))
         elements.append(Paragraph(f"Taxonomy Table: {os.path.join(output_dir, 'microbiome_ai_taxonomy.csv')}", styles['BodyText']))
         
         doc.build(elements)
@@ -530,7 +530,7 @@ def process_sequences(filtFs, filtRs, sample_names, silva, output_dir):
             taxa.append(['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus'])
         taxa = pd.DataFrame(taxa, index=seqtab.columns, columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus'])
         
-        seqtab.to_csv(os.path.join(output_dir, 'microbiome_ai_16s_otu.csv'), sep='\t')
+        seqtab.to_csv(os.path.join(output_dir, 'microbiome_ai_16s_asv.csv'), sep='\t')
         taxa.to_csv(os.path.join(output_dir, 'microbiome_ai_taxonomy.csv'), sep='\t')
         
         logger.info(f"Processed sequences to: {output_dir}")
@@ -549,19 +549,19 @@ def create_phyloseq_object(seqtab, taxa, metadata):
         metadata: Metadata DataFrame
     
     Returns:
-        dict: Phyloseq object containing otu, tax, and meta
+        dict: Phyloseq object containing asv, tax, and meta
     """
     try:
-        otu = seqtab.T
+        asv = seqtab.T
         tax = taxa
         meta = metadata
-        global_data['ps'] = {'otu': otu, 'tax': tax, 'meta': meta}
+        global_data['ps'] = {'asv': asv, 'tax': tax, 'meta': meta}
         global_data['ps1'] = global_data['ps']
         global_data['seqtab_nochim'] = seqtab
         global_data['taxa'] = taxa
         global_data['metadata'] = metadata
         
-        global_data['ps1'] = {'outu': otu[~tax['Order'].isin(['Chloroplast']) & ~tax['Family'].isin(['t', 'Mitochondria'])],
+        global_data['ps1'] = {'asv': asv[~tax['Order'].isin(['Chloroplast']) & ~tax['Family'].isin(['t', 'Mitochondria'])],
                               'tax': tax[~tax['Order'].isin(['Chloroplast']) & ~tax['Family'].isin(['t', 'Mitochondria'])],
                               'meta': meta}
         logger.info("Created phyloseq object successfully")
@@ -583,9 +583,9 @@ def calculate_alpha_diversity(ps1, treatment):
     """
     try:
         meta = ps1['meta'].copy()
-        otu = ps1['otu']
-        shannon = alpha_diversity('shannon', otu, ids=otu.index)
-        simpson = alpha_diversity('simpson', otu, ids=otu.index)
+        asv = ps1['asv']
+        shannon = alpha_diversity('shannon', asv, ids=asv.index)
+        simpson = alpha_diversity('simpson', asv, ids=asv.index)
         meta['Shannon'] = shannon
         meta['InverseSimpson'] = 1 / (1 - simpson)
         meta[treatment] = meta[treatment].astype(str)
@@ -607,25 +607,25 @@ def calculate_beta_diversity(ps1):
         tuple: (relative_abundance_table, metadata)
     """
     try:
-        otu = ps1['otu']
-        otu_rel = otu.div(otu.sum(axis=1), axis=0)
-        global_data['pseq'] = {'otu_rel': otu_rel, 'tax': ps1['tax'], 'meta': ps1['meta']}
-        global_data['otu_rel'] = otu_rel
+        asv = ps1['asv']
+        asv_rel = asv.div(asv.sum(axis=1), axis=0)
+        global_data['pseq'] = {'asv_rel': asv_rel, 'tax': ps1['tax'], 'meta': ps1['meta']}
+        global_data['asv_rel'] = asv_rel
         global_data['meta_rel'] = ps1['meta']
-        global_data['otu_absolute'] = otu
+        global_data['asv_absolute'] = asv
         global_data['meta_absolute'] = ps1['meta']
         logger.info("Calculated beta diversity")
-        return otu_rel, ps1['meta']
+        return asv_rel, ps1['meta']
     except Exception as e:
         logger.error(f"Error calculating beta diversity: {e}")
         return None, None
 
-def perform_pca(otu, top_n):
+def perform_pca(asv, top_n):
     """
     Perform PCA on top N ASVs.
     
     Args:
-        otu: OTU table
+        asv: asv table
         top_n: Number of top ASVs to include
     
     Returns:
@@ -634,12 +634,12 @@ def perform_pca(otu, top_n):
     try:
         from sklearn.preprocessing import StandardScaler
         from sklearn.decomposition import PCA
-        top_asvs = otu.sum().nlargest(top_n).index
-        otu_top = otu[top_asvs]
+        top_asvs = asv.sum().nlargest(top_n).index
+        asv_top = asv[top_asvs]
         scaler = StandardScaler()
-        otu_scaled = scaler.fit_transform(otu_top)
+        asv_scaled = scaler.fit_transform(asv_top)
         pca = PCA(n_components=5)
-        pca_result = pca.fit_transform(otu_scaled)
+        pca_result = pca.fit_transform(asv_scaled)
         explained_variance = pca.explained_variance_ratio_
         logger.info("Performed PCA successfully")
         return pca_result, explained_variance
@@ -647,12 +647,12 @@ def perform_pca(otu, top_n):
         logger.error(f"Error performing PCA: {e}")
         return None, None
 
-def perform_pcoa(otu, meta, treatment, pval_threshold, contrib_threshold):
+def perform_pcoa(asv, meta, treatment, pval_threshold, contrib_threshold):
     """
     Perform PCoA on beta diversity distance matrix.
     
     Args:
-        otu: OTU table
+        asv: asv table
         meta: Metadata DataFrame
         treatment: Column name for grouping
         pval_threshold: P-value threshold for significance
@@ -662,9 +662,9 @@ def perform_pcoa(otu, meta, treatment, pval_threshold, contrib_threshold):
         tuple: (PCoA scores, distance matrix)
     """
     try:
-        dm = beta_diversity('braycurtis', otu)
+        dm = beta_diversity('braycurtis', asv)
         ordination = pcoa(dm)
-        scores = pd.DataFrame(ordination.samples, index=otu.index)
+        scores = pd.DataFrame(ordination.samples, index=asv.index)
         scores = scores.join(meta[[treatment]])
         logger.info("Performed PCoA successfully")
         return scores, dm
@@ -1052,38 +1052,38 @@ def run_analysis(n_clicks, r1_contents, r1_filenames, r2_contents, r2_filenames,
             raise ValueError("Failed to create phyloseq object")
         prev = seqtab.sum(axis=0)
         keep_taxa = prev[prev >= prev_threshold].index
-        ps1['otu'] = ps1['otu'].loc[keep_taxa]
+        ps1['asv'] = ps1['asv'].loc[keep_taxa]
         ps1['tax'] = ps1['tax'].loc[keep_taxa]
         
         ps1_meta = calculate_alpha_diversity(ps1, treatment)
-        if not ps1_meta:
+        if ps1_meta is None:
             raise ValueError("Failed to calculate alpha diversity")
-        otu_rel, meta_rel = calculate_beta_diversity(ps1)
-        if not otu_rel or not meta_rel:
+        asv_rel, meta_rel = calculate_beta_diversity(ps1)
+        if asv_rel is None or meta_rel is None:
             raise ValueError("Failed to calculate beta diversity")
         
         top_asvs_list = [int(x.strip()) for x in top_asvs.split(',') if x.strip()]
-        pca_result, explained_variance = perform_pca(otu_rel, top_asvs_list[-1])
-        if not pca_result:
+        pca_result, explained_variance = perform_pca(asv_rel, top_asvs_list[-1])
+        if pca_result is None:
             raise ValueError("Failed to perform PCA")
         global_data['pca_result'] = pca_result
         global_data['explained_variance'] = explained_variance
         
         if param_mode == 'ai_automatic':
-            pca_pcoa_params = ai_analyze_pca_pcoa(otu_rel, explained_variance) if ai_available else None
+            pca_pcoa_params = ai_analyze_pca_pcoa(asv_rel, explained_variance) if ai_available else None
             if pca_pcoa_params:
                 top_asvs = pca_pcoa_params['top_asvs']
                 pval_threshold = pca_pcoa_params['pval_threshold']
                 contrib_threshold = pca_pcoa_params['contrib_threshold']
             top_asvs_list = [int(x.strip()) for x in top_asvs.split(',') if x.strip()]
-            pca_result, explained_variance = perform_pca(otu_rel, top_asvs_list[-1])
+            pca_result, explained_variance = perform_pca(asv_rel, top_asvs_list[-1])
             global_data['pca_result'] = pca_result
             global_data['explained_variance'] = explained_variance
         
-        pcoa_scores, dm = perform_pcoa(otu_rel, meta_rel, treatment, pval_threshold, contrib_threshold)
-        if not pcoa_scores:
+        pcoa_scores, dm = perform_pcoa(asv_rel, meta_rel, treatment, pval_threshold, contrib_threshold)
+        if pcoa_scores is None:
             raise ValueError("Failed to perform PCoA")
-        ps1_melt = otu_rel.reset_index().melt(id_vars=['index'], var_name='ASV', value_name='Abundance')
+        ps1_melt = asv_rel.reset_index().melt(id_vars=['index'], var_name='ASV', value_name='Abundance')
         ps1_melt = ps1_melt.merge(meta_rel[[treatment]], left_on='index', right_index=True)
         ps1_melt['Abundance'] *= 100
         tree_img = plot_phylogenetic_tree(seqtab)
@@ -1102,7 +1102,7 @@ def run_analysis(n_clicks, r1_contents, r1_filenames, r2_contents, r2_filenames,
         abundance_fig = px.histogram(ps1_melt, x='index', y='Abundance', color='ASV', facet_col=treatment, title="Abundance by Treatment")
         
         output_files = [
-            html.P(f"ASV Table: {os.path.join(output_dir, 'microbiomeai_16s_otu.csv')}"),
+            html.P(f"ASV Table: {os.path.join(output_dir, 'microbiomeai_16s_asv.csv')}"),
             html.P(f"Taxonomy Table: {os.path.join(output_dir, 'microbiomeai_taxonomy.csv')}")
         ]
         
@@ -1153,9 +1153,9 @@ def download_report(n_clicks, output_dir):
         report_path = generate_pdf_report(
             global_data['seqtab_nochim'],
             global_data['ps1']['meta'],
-            global_data['pseq_rel']['meta'].join(global_data['otu_rel']),
+            global_data['pseq_rel']['meta'].join(global_data['asv_rel']),
             (global_data['pca_result'], global_data['explained_variance']),
-            global_data['otu_rel'].reset_index().melt(id_vars=['index'], var_name='ASV', value_name='Abundance'),
+            global_data['asv_rel'].reset_index().melt(id_vars=['index'], var_name='ASV', value_name='Abundance'),
             plot_phylogenetic_tree(global_data['seqtab_nochim']),
             global_data['ai_interpretations'],
             output_dir
