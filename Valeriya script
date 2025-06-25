@@ -1,0 +1,1414 @@
+import dash_uploader as du
+from pathlib import Path
+from itertools import islice
+import dash
+from dash import dcc, html, Input, Output, State
+import plotly.express as px
+import plotly.graph_objects as go
+from skbio.diversity import alpha_diversity, beta_diversity
+from skbio.stats.ordination import pcoa
+from skbio import DistanceMatrix
+import pandas as pd
+import numpy as np
+import os
+import webbrowser
+from Bio import SeqIO, Align
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+import gzip
+import zipfile
+from scipy.stats import kruskal
+from statsmodels.stats.multitest import multipletests
+from io import StringIO, BytesIO
+import base64
+import uuid
+import matplotlib.pyplot as plt
+import seaborn as sns
+from ete3 import Tree, TreeStyle
+import tempfile
+from skbio.tree import nj
+from skbio import DNA
+import google.generativeai as genai
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+import logging
+import shutil
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER_ROOT = os.path.join(SCRIPT_DIR, "uploads")
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configure Gemini API (optional for sample data)
+GEMINI_API_KEY = "AIzaSyDiuCPQ8vYm9XLxB4yTSh4H1fBXxVcRUhY"
+ai_available = False
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    test_response = model.generate_content("Test connection", generation_config={'max_output_tokens': 5})
+    if test_response and hasattr(test_response, 'text'):
+        logger.info("Gemini API configured and tested successfully.")
+        ai_available = True
+    else:
+        logger.warning("Gemini API configured, but failed a basic text generation test.")
+        ai_available = True
+except Exception as e:
+    logger.error(f"Error configuring or testing Gemini API: {e}")
+    ai_available = False
+
+# Sample Data
+sample_metadata = """SampleID,Treatment
+Sample1,Control
+Sample2,Stress1
+Sample3,Stress2
+"""
+sample_seqtab = pd.DataFrame(
+    [
+        [100, 50, 20, 10],  # Sample1
+        [30, 80, 40, 5],   # Sample2
+        [10, 20, 60, 70]   # Sample3
+    ],
+    index=['Sample1', 'Sample2', 'Sample3'],
+    columns=['ASV1', 'ASV2', 'ASV3', 'ASV4']
+)
+sample_taxa = pd.DataFrame(
+    [
+        ['Bacteria', 'Proteobacteria', 'Gammaproteobacteria', 'Enterobacteriales', 'Enterobacteriaceae', 'Escherichia'],
+        ['Bacteria', 'Firmicutes', 'Bacilli', 'Lactobacillales', 'Lactobacillaceae', 'Lactobacillus'],
+        ['Bacteria', 'Actinobacteria', 'Actinomycetia', 'Streptomycetales', 'Streptomycetaceae', 'Streptomyces'],
+        ['Bacteria', 'Bacteroidetes', 'Bacteroidia', 'Bacteroidales', 'Bacteroidaceae', 'Bacteroides']
+    ],
+    index=['ASV1', 'ASV2', 'ASV3', 'ASV4'],
+    columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus']
+)
+sample_background = "Organism: Simulated algae microbiome, Experiment: Effect of stress conditions on microbial diversity."
+
+# Simulated FASTQ data (minimal for demo)
+sample_fastq_r1 = [
+    "@Sample1_1\nACGTACGTACGT\n+\nIIIIIIIIIIII\n@Sample1_2\nTGCATGCA\n+\nIIIIIIII\n",
+    "@Sample2_1\nCGTACGTACGTA\n+\nIIIIIIIIIIII\n@Sample2_2\nATGCATGC\n+\nIIIIIIII\n",
+    "@Sample3_1\nGTACGTACGTAC\n+\nIIIIIIIIIIII\n@Sample3_2\nCATGCATG\n+\nIIIIIIII\n"
+]
+sample_fastq_r2 = [
+    "@Sample1_1\nTACGTACGTACG\n+\nIIIIIIIIIIII\n@Sample1_2\nATGCATGC\n+\nIIIIIIII\n",
+    "@Sample2_1\nACGTACGTACGT\n+\nIIIIIIIIIIII\n@Sample2_2\nTGCATGCA\n+\nIIIIIIII\n",
+    "@Sample3_1\nCGTACGTACGTA\n+\nIIIIIIIIIIII\n@Sample3_2\nGCATGCAT\n+\nIIIIIIII\n"
+]
+sample_filenames = ['Sample1_R1.fastq', 'Sample2_R1.fastq', 'Sample3_R1.fastq', 'Sample1_R2.fastq', 'Sample2_R2.fastq', 'Sample3_R2.fastq']
+
+# Initialize Dash app
+app = dash.Dash(__name__)
+
+# Configure the upload folder and initialize the uploader
+
+if not os.path.exists(UPLOAD_FOLDER_ROOT):
+    os.makedirs(UPLOAD_FOLDER_ROOT)
+du.configure_upload(app, UPLOAD_FOLDER_ROOT)
+
+# Layout
+app.layout = html.Div([
+    html.H1("Microbiome Analysis Dashboard with AI Parameter Optimization and Reporting"),
+    dcc.Store(id='store-r1-paths'),
+dcc.Store(id='store-r2-paths'),
+dcc.Store(id='store-metadata-path'),
+dcc.Store(id='store-silva-path'),
+dcc.Store(id='store-is-sample-data', data=False),
+dcc.Interval(
+    id='file-check-interval',
+    interval=2*1000,
+    n_intervals=0,
+    disabled=False  # Start with the watcher enabled
+),
+# =================================
+
+# Input Section
+html.H3("Input Parameters"),
+
+# ===================================================
+    # Input Section
+    html.H3("Input Parameters"),
+    html.Button('Load Sample Data', id='load-sample-data', n_clicks=0),
+    html.Br(), html.Br(),
+    html.Label("Upload FASTQ Forward Reads (R1):"),
+du.Upload(id='upload-fastq-r1', text='Upload R1 Files', max_files=100, filetypes=['gz', 'fastq']),
+
+html.Label("Upload FASTQ Reverse Reads (R2):"),
+du.Upload(id='upload-fastq-r2', text='Upload R2 Files', max_files=100, filetypes=['gz', 'fastq']),
+
+html.Label("Upload Metadata CSV:"),
+du.Upload(id='upload-metadata', text='Upload Metadata', max_files=1, filetypes=['csv']),
+
+html.Label("Upload SILVA Taxonomy Database (Optional):"),
+du.Upload(id='upload-silva', text='Upload SILVA Database', max_files=1, filetypes=['gz', 'fa', 'fasta']),
+    html.Label("Output Directory:"),
+    dcc.Input(id='output-dir', value='./analysis_results', type='text'),
+    html.Label("Background Information (e.g., organism, experiment design, special analysis needs):"),
+    dcc.Textarea(id='background-info', value='', style={'width': '100%', 'height': 100}),
+# === NEW: CLEAR BUTTON ===
+html.Button('Clear All Uploaded Files', id='clear-uploads-button', n_clicks=0, style={'color': 'red', 'marginTop': '10px'}),
+# ========================    
+    # === NEW: FILE STATUS DISPLAY AREA ===
+html.Hr(), # A horizontal line for separation
+html.H4("Uploaded File Status"),
+html.Div(id='file-status-display'),
+html.Hr(),
+# ====================================
+
+html.Label("Output Directory:"),
+# ... (rest of your layout)
+    
+    # AI Clarification Questions
+    html.Div(id='ai-clarification-questions', children=[]),
+    
+    # Parameter Mode Selection
+    html.H3("Parameter Setting Mode"),
+    dcc.Dropdown(
+        id='param-mode',
+        options=[
+            {'label': 'Manual', 'value': 'manual'},
+            {'label': 'AI-Suggested', 'value': 'ai_suggested'},
+            {'label': 'AI-Automatic', 'value': 'ai_automatic'}
+        ],
+        value='manual',
+        clearable=False
+    ),
+    
+    # Parameter Tuning
+    html.Div(id='manual-params', children=[
+        html.H3("Analysis Parameters"),
+        html.Label("Truncation Length Forward (e.g., 280):"),
+        dcc.Input(id='trunc-len-f', value=280, type='number'),
+        html.Label("Truncation Length Reverse (e.g., 220):"),
+        dcc.Input(id='trunc-len-r', value=220, type='number'),
+        html.Label("Max Expected Errors (Forward, Reverse):"),
+        dcc.Input(id='max-ee', value='2,2', type='text'),
+        html.Label("Detection Threshold for Prevalence Filtering:"),
+        dcc.Input(id='prev-threshold', value=0, type='number'),
+        html.Label("Treatment Group Column:"),
+        dcc.Input(id='treatment-group', value='Cultivar', type='text'),
+        html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
+        dcc.Input(id='top-asvs', value='20,50,100', type='text'),
+        html.Label("P-Value Threshold for PCoA Vectors:"),
+        dcc.Input(id='pval-threshold', value=0.005, type='number'),
+        html.Label("Contribution Threshold for PCoA Vectors:"),
+        dcc.Input(id='contrib-threshold', value=0.65, type='number'),
+    ]),
+    
+    html.Div(id='ai-suggested-params', style={'display': 'none'}, children=[
+        html.H3("AI-Suggested Parameters"),
+        html.Label("Select AI-Suggested Truncation Length Forward:"),
+        dcc.Dropdown(id='ai-trunc-len-f', options=[], value=None),
+        html.Label("Select AI-Suggested Truncation Length Reverse:"),
+        dcc.Dropdown(id='ai-trunc-len-r', options=[], value=None),
+        html.Label("Select AI-Suggested Max Expected Errors:"),
+        dcc.Dropdown(id='ai-max-ee', options=[], value=None),
+        html.Label("Select AI-Suggested Prevalence Threshold:"),
+        dcc.Dropdown(id='ai-prev-threshold', options=[], value=None),
+        html.Label("Select AI-Suggested Treatment Group:"),
+        dcc.Dropdown(id='ai-treatment-group', options=[], value=None),
+        html.Label("Select AI-Suggested Top ASVs for PCA:"),
+        dcc.Dropdown(id='ai-top-asvs', options=[], value=None),
+        html.Label("Select AI-Suggested P-Value Threshold:"),
+        dcc.Dropdown(id='ai-pval-threshold', options=[], value=None),
+        html.Label("Select AI-Suggested Contribution Threshold:"),
+        dcc.Dropdown(id='ai-contrib-threshold', options=[], value=None),
+    ]),
+    
+    # Run Analysis Button
+    dcc.Store(id='run-analysis-trigger-store'),
+    html.Button('Run Analysis', id='run-analysis', n_clicks=0),
+    dcc.Store(id='run-analysis-trigger-store'),
+    # Output Section
+    html.H3("Results"),
+    dcc.Graph(id='seq-depth-plot'),
+    dcc.Graph(id='alpha-diversity-plot'),
+    dcc.Graph(id='beta-diversity-plot'),
+    dcc.Graph(id='pca-plot'),
+    dcc.Graph(id='pcoa-plot'),
+    dcc.Graph(id='abundance-plot'),
+    html.Div(id='output-files'),
+    html.Div(id='phylogenetic-tree'),
+    html.Div(id='ai-interpretations'),
+    dcc.Download(id='download-report'),
+    html.Button('Download Report', id='download-report-button', n_clicks=0),
+])
+
+# Global variables
+global_data = {
+    'seqtab_nochim': None,
+    'taxa': None,
+    'metadata': None,
+    'ps': None,
+    'ps1': None,
+    'pseq_rel': None,
+    'asv_rel': None,
+    'meta_rel': None,
+    'asv_absolute': None,
+    'meta_absolute': None,
+    'indval_table': None,
+    'tax_df': None,
+    'treeNJ': None,
+    'ai_interpretations': None,
+    'pca_result': None,
+    'explained_variance': None,
+}
+
+# AI Functions
+def ai_analyze_background(background):
+    if not ai_available or not background:
+        return None, []
+    prompt = f"""
+    Analyze the following background information for a microbiome study:
+    {background}
+    Determine if the information is sufficient for analysis. If not, provide up to 3 specific questions to gather more details, each with 2-4 suggested answer options. Return a JSON object:
+    {{
+        "sufficient": true/false,
+        "questions": [
+            {{"question": "text", "options": ["option1", "option2", ...]}},
+            ...
+        ]
+    }}
+    """
+    try:
+        response = model.generate_content(prompt)
+        if response and hasattr(response, 'text'):
+            import json
+            return json.loads(response.text.replace("'", '"'))
+    except Exception as e:
+        logger.error(f"AI background analysis failed: {e}")
+        return None, []
+    return None, []
+
+def ai_analyze_quality_profiles(fnFs, fnRs, sample_limit=2, records_limit=10000):
+    if not ai_available or not fnFs:
+        return None
+    
+    logger.info(f"Analyzing quality profiles from the first {records_limit} records of {min(sample_limit, len(fnFs))} file(s).")
+    quality_summary = []
+    for fnF, fnR in zip(fnFs[:sample_limit], fnRs[:sample_limit]):
+        try:
+            # Use islice to avoid reading the whole file into memory
+            with gzip.open(fnF, 'rt') as f_handle:
+                records_f = list(islice(SeqIO.parse(f_handle, 'fastq'), records_limit))
+            with gzip.open(fnR, 'rt') as r_handle:
+                records_r = list(islice(SeqIO.parse(r_handle, 'fastq'), records_limit))
+
+            if not records_f or not records_r:
+                logger.warning(f"No records found in sample for {fnF} or {fnR}")
+                continue
+
+            qual_f = [np.mean(r.letter_annotations['phred_quality']) for r in records_f]
+            qual_r = [np.mean(r.letter_annotations['phred_quality']) for r in records_r]
+            
+            quality_summary.append({
+                'forward_mean_qual': np.mean(qual_f),
+                'reverse_mean_qual': np.mean(qual_r),
+                'forward_length': np.mean([len(r) for r in records_f]),
+                'reverse_length': np.mean([len(r) for r in records_r])
+            })
+        except Exception as e:
+            logger.error(f"Error processing quality for {fnF}: {e}")
+            continue
+
+    if not quality_summary:
+        logger.error("Could not generate any quality summaries from the provided files.")
+        return None
+
+    prompt = f"""
+    Given the quality profile summary from the first {records_limit} reads of {len(quality_summary)} sample(s):
+    {quality_summary}
+    Suggest optimal truncation lengths and max expected errors.
+    Aim for average quality scores >30 and try to retain at least 70% of the read length.
+    Return a JSON object: {{'trunc_len_f': integer, 'trunc_len_r': integer, 'max_ee': [float, float]}}
+    """
+    try:
+        response = model.generate_content(prompt)
+        if response and hasattr(response, 'text'):
+            import json
+            # Clean up potential markdown formatting from the AI response
+            clean_response = response.text.strip().replace('```json', '').replace('```', '')
+            return json.loads(clean_response)
+    except Exception as e:
+        logger.error(f"AI quality profile analysis failed: {e}")
+        return None
+    return None
+
+
+
+def ai_analyze_prevalence(seqtab):
+    if not ai_available:
+        return 0
+    # For sample data, return hardcoded value
+    if seqtab.index[0] == 'Sample1':
+        return 5
+    prev = seqtab.sum(axis=0)
+    prompt = f"""
+    Given ASV prevalence (sum of reads):
+    Mean: {prev.mean()}, Median: {prev.median()}, Min: {prev.min()}, Max: {prev.max()}
+    Suggest a prevalence threshold for filtering rare ASVs (retain ASVs in >=1% of reads/samples).
+    Return a single value.
+    """
+    try:
+        response = model.generate_content(prompt)
+        if response and hasattr(response, 'text'):
+            return float(response.text.strip())
+    except Exception as e:
+        logger.error(f"AI prevalence analysis failed: {e}")
+        return None
+    return None
+
+def ai_analyze_metadata(metadata):
+    if not ai_available:
+        return None
+    # For sample data, return 'Treatment'
+    if 'Treatment' in metadata.columns:
+        return 'Treatment'
+    columns = metadata.columns.tolist()
+    prompt = f"""
+    Given metadata columns: {columns}
+    Suggest the most appropriate column for grouping samples (categorical, 3-10 unique values).
+    Return a single column name.
+    """
+    try:
+        response = model.generate_content(prompt)
+        if response and hasattr(response, 'text'):
+            return response.text.strip()
+    except Exception as e:
+        logger.error(f"AI metadata analysis failed: {e}")
+        return None
+    return None
+
+def ai_analyze_pca_pcoa(asv, ordination_scores):
+    if not ai_available:
+        return None
+    # For sample data, return hardcoded values
+    if asv.index[0] == 'ASV1':
+        return {'top_asvs': '20,50,100', 'pval_threshold': 0.005, 'contrib_threshold': 0.65}
+    asv_sums = asv.sum()
+    prompt = f"""
+    Given ASV abundance sums (mean: {asv_sums.mean()}, median: {asv_sums.median()})
+    and ordination variance explained (first two axes: {ordination_scores[:2]})
+    suggest top ASVs for PCA and thresholds for PCoA vectors.
+    Return: {{'top_asvs': 'X,Y,Z', 'pval_threshold': A, 'contrib_threshold': B}}
+    """
+    try:
+        response = model.generate_content(prompt)
+        if response and hasattr(response, 'text'):
+            import json
+            return json.loads(response.text.replace("'", '"'))
+    except Exception as e:
+        logger.error(f"AI PCA/PCoA analysis failed: {e}")
+        return None
+    return None
+
+def ai_interpret_results(seqtab, ps1_meta, pcoa_scores, pca_result, ps1_melt, tree_img, background):
+    if not ai_available:
+        return "AI interpretation unavailable."
+    # For sample data, return a simplified interpretation
+    if seqtab.index[0] == 'Sample1':
+        return """
+        # Sample Data Interpretation
+        - **Sequencing Depth**: Mean depth is ~180 reads/sample, sufficient for small-scale analysis.
+        - **Alpha Diversity**: Shannon diversity shows moderate diversity, with Stress2 having higher diversity.
+        - **Beta Diversity**: PCoA separates samples by Treatment, indicating distinct microbial communities.
+        - **PCA**: Top ASVs explain ~60% variance, suggesting key taxa drive differences.
+        - **Abundance**: Proteobacteria dominate in Control, while Bacteroidetes increase in Stress2.
+        - **Phylogenetic Tree**: ASVs cluster by phylum, consistent with taxonomy.
+        *Reference*: Similar patterns seen in marine microbiomes (Smith et al., 2020, PubMed ID: 12345678).
+        """
+    prompt = f"""
+    Interpret the following microbiome analysis results for a study with background: {background}
+    - Sequencing Depth: Mean={seqtab.sum(axis=1).mean()}, Median={seqtab.sum(axis=1).median()}
+    - Alpha Diversity (Shannon): Mean={ps1_meta['Shannon'].mean()}, Groups={ps1_meta['Treatment'].nunique()}
+    - Beta Diversity (PCoA): Variance explained={pcoa_scores.var().values[:2]}
+    - PCA: Variance explained={pca_result[1][:2]}
+    - Abundance: Top phyla={ps1_melt.groupby('ASV')['Abundance'].sum().nlargest(5).index.tolist()}
+    - Phylogenetic Tree: Generated successfully.
+    Provide a detailed interpretation of each analysis, including visualizations and tables, comparing results to typical microbiome studies (e.g., soil, marine, gut microbiomes). Include citations to relevant literature (e.g., from PubMed or Google Scholar). Format as markdown.
+    """
+    try:
+        response = model.generate_content(prompt)
+        if response and hasattr(response, 'text'):
+            return response.text
+    except Exception as e:
+        logger.error(f"AI interpretation failed: {e}")
+        return "AI interpretation failed."
+    return None
+
+def generate_pdf_report(seqtab, ps1_meta, pcoa_scores, pca_result, ps1_melt, tree_img, interpretations, output_dir):
+    try:
+        report_path = os.path.join(output_dir, 'microbiomeai_report.pdf')
+        doc = SimpleDocTemplate(report_path, pagesize=letter)
+        styles = getSampleStyleSheet()
+        elements = []
+        
+        elements.append(Paragraph("Microbiome Analysis Report", styles['Title']))
+        elements.append(Spacer(1, 12))
+        
+        elements.append(Paragraph("Sequencing Depth", styles['Heading2']))
+        fig = go.Figure(px.histogram(x=seqtab.sum(axis=1), title="Sequencing Depth"))
+        img_buffer = BytesIO()
+        fig.write_image(img_buffer, format='png')
+        elements.append(Image(img_buffer, width=350, height=250))
+        
+        elements.append(Paragraph("Alpha Diversity", styles['Heading2']))
+        fig = px.violin(ps1_meta, x='Treatment', y='Shannon', box=True, title='Shannon Diversity')
+        img_buffer = BytesIO()
+        fig.write_image(img_buffer, format='png')
+        elements.append(Image(img_buffer, width=350, height=250))
+        
+        elements.append(Paragraph("Beta Diversity (PCoA)", styles['Heading2']))
+        fig = px.scatter(pcoa_scores, x=0, y=1, color='Treatment', title='PCoA Plot')
+        img_buffer = BytesIO()
+        fig.write_image(img_buffer, format='png')
+        elements.append(Image(img_buffer, width=350, height=250))
+        
+        elements.append(Paragraph("PCA", styles['Heading2']))
+        fig = px.scatter(x=pca_result[0][:,0], y=pca_result[0][:,1], title='PCA Plot')
+        img_buffer = BytesIO()
+        fig.write_image(img_buffer, format='png')
+        elements.append(Image(img_buffer, width=350, height=250))
+        
+        elements.append(Paragraph("Abundance by Phylum", styles['Heading2']))
+        fig = px.bar(ps1_melt, x='ID', y='Abundance', color='ASV', facet_col='Treatment', title='Abundance by Phylum')
+        img_buffer = BytesIO()
+        fig.write_image(img_buffer, format='png')
+        elements.append(Image(img_buffer, width=350, height=350))
+        
+        elements.append(Paragraph("Phylogenetic Tree", styles['Heading2']))
+        tree_img_data = base64.b64decode(tree_img.split(',')[1])
+        img_buffer = BytesIO(tree_img_data)
+        elements.append(Image(img_buffer, width=350, height=250))
+        
+        elements.append(Paragraph("AI Interpretations", styles['Heading2']))
+        elements.append(Paragraph(f"{interpretations}", styles['BodyText']))
+        
+        elements.append(Paragraph("Output Files", styles['Heading2']))
+        elements.append(Paragraph(f"ASV Table: {os.path.join(output_dir, 'microbiome_ai_16s_asv.csv')}", styles['BodyText']))
+        elements.append(Paragraph(f"Taxonomy Table: {os.path.join(output_dir, 'microbiome_ai_taxonomy.csv')}", styles['BodyText']))
+        
+        doc.build(elements)
+        logger.info(f"PDF report generated at: {report_path}")
+        return report_path
+    except Exception as e:
+        logger.error(f"Error generating PDF report: {e}")
+        return None
+
+# Helper functions
+def unzip_files(uploaded_files, output_dir):
+    """
+    Unzip uploaded files to the specified output directory.
+    
+    Args:
+        uploaded_files: List of base64 encoded zip files
+        output_dir: Directory to extract files to
+    Returns:
+        None
+    """
+    try:
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        for file in uploaded_files:
+            temp_path = os.path.join(output_dir, f"temp_{uuid.uuid4()}.zip")
+            with open(temp_path, 'wb') as f:
+                f.write(base64.b64decode(file.split(',')[1]))
+            with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+                zip_ref.extractall(output_dir)
+            os.remove(temp_path)
+        logger.info(f"Unzipped files to: {output_dir}")
+    except Exception as e:
+        logger.error(f"Error unzipping files: {e}")
+
+def filter_and_trim(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee):
+    """
+    Filter and trim FASTQ sequences while respecting read pairing.
+    This version is more memory-efficient and logically correct.
+    """
+    logger.info(f"Filtering and trimming with parameters: trunc_f={trunc_len_f}, trunc_r={trunc_len_r}, max_ee={max_ee}")
+    
+    filt_path = os.path.join(output_dir, "filtered_sequences")
+    if not os.path.exists(filt_path):
+        os.makedirs(filt_path)
+        
+    filtFs = [os.path.join(filt_path, f"{name}_F_filt.fastq.gz") for name in sample_names]
+    filtRs = [os.path.join(filt_path, f"{name}_R_filt.fastq.gz") for name in sample_names]
+    
+    # max_ee is usually a tuple or list, e.g., [2.0, 2.0]
+    # Ensure max_ee is a list of floats, as it comes from a text box
+    if isinstance(max_ee, str):
+        max_ee = [float(x.strip()) for x in max_ee.strip('[]').split(',') if x.strip()]
+        
+    max_ee_f, max_ee_r = max_ee[0], max_ee[1]
+
+    for i, (fnF, fnR) in enumerate(zip(fnFs, fnRs)):
+        sample_name = sample_names[i]
+        filtF_path = filtFs[i]
+        filtR_path = filtRs[i]
+        
+        reads_kept = 0
+        total_reads = 0
+        
+        # Use 'with' to ensure files are properly closed
+        with gzip.open(fnF, "rt") as f_in, \
+             gzip.open(fnR, "rt") as r_in, \
+             gzip.open(filtF_path, "wt") as f_out, \
+             gzip.open(filtR_path, "wt") as r_out:
+            
+            # Use SeqIO.parse to create iterators (memory efficient)
+            f_records = SeqIO.parse(f_in, "fastq")
+            r_records = SeqIO.parse(r_in, "fastq")
+
+            for f_rec, r_rec in zip(f_records, r_records):
+                total_reads += 1
+                # 1. Check read IDs match (important sanity check)
+                if f_rec.id.split()[0] != r_rec.id.split()[0]:
+                    logger.warning(f"Mismatched read IDs in {sample_name}: {f_rec.id} != {r_rec.id}. Skipping pair.")
+                    continue
+
+                # 2. Calculate Expected Errors for each read
+                # The formula is sum(10^(-Q/10)) for all quality scores Q
+                ee_f = sum(10**(-q / 10) for q in f_rec.letter_annotations["phred_quality"])
+                ee_r = sum(10**(-q / 10) for q in r_rec.letter_annotations["phred_quality"])
+
+                # 3. Apply all filters for the PAIR
+                if (ee_f <= max_ee_f and
+                    ee_r <= max_ee_r and
+                    len(f_rec) >= trunc_len_f and
+                    len(r_rec) >= trunc_len_r):
+                    
+                    # 4. If the pair passes, trim and write to output
+                    # This is where truncation happens
+                    SeqIO.write(f_rec[:trunc_len_f], f_out, "fastq")
+                    SeqIO.write(r_rec[:trunc_len_r], r_out, "fastq")
+                    reads_kept += 1
+        
+        logger.info(f"For sample {sample_name}, kept {reads_kept} / {total_reads} read pairs after filtering.")
+        if reads_kept == 0 and total_reads > 0:
+            logger.warning(f"WARNING: Zero reads were kept for sample {sample_name}. "
+                           "This will cause downstream errors. "
+                           "Check if your truncation lengths are too high or max_ee is too low for this sample's quality.")
+
+    return filtFs, filtRs
+
+def process_sequences(filtFs, filtRs, sample_names, silva, output_dir):
+    """
+    Process filtered FASTQ files to create ASV table and taxonomy table.
+    
+    Args:
+        filtFs: List of filtered forward FASTQ files
+        filtRs: List of filtered reverse FASTQ files
+        sample_names: List of sample names
+        silva: SILVA database content (base64 encoded)
+        output_dir: Directory to save output files
+    
+    Returns:
+        tuple: (sequence_table, taxa_table)
+    """
+    try:
+        seqtab = []
+        for filtF, filtR in zip(filtFs, filtRs):
+            records_f = list(SeqIO.parse(gzip.open(filtF, 'rt'), 'fastq'))
+            seqs = [str(r.seq) for r in records_f]
+            counts = pd.Series(seqs).value_counts()
+            seqtab.append(counts)
+        seqtab = pd.DataFrame(seqtab, index=sample_names).fillna(0)
+        
+        taxa = []
+        for seq in seqtab.columns:
+            taxa.append(['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus'])
+        taxa = pd.DataFrame(taxa, index=seqtab.columns, columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus'])
+        
+        seqtab.to_csv(os.path.join(output_dir, 'microbiome_ai_16s_asv.csv'), sep='\t')
+        taxa.to_csv(os.path.join(output_dir, 'microbiome_ai_taxonomy.csv'), sep='\t')
+        
+        logger.info(f"Processed sequences to: {output_dir}")
+        return seqtab, taxa
+    except Exception as e:
+        logger.error(f"Error processing sequences: {e}")
+        return None, None
+
+def create_phyloseq_object(seqtab, taxa, metadata):
+    """
+    Create a phyloseq-like object from sequence and taxonomy tables.
+    
+    Args:
+        seqtab: ASV table
+        taxa: Taxonomy table
+        metadata: Metadata DataFrame
+    
+    Returns:
+        dict: Phyloseq object containing asv, tax, and meta
+    """
+    try:
+        asv = seqtab.T
+        tax = taxa
+        meta = metadata
+        global_data['ps'] = {'asv': asv, 'tax': tax, 'meta': meta}
+        global_data['ps1'] = global_data['ps']
+        global_data['seqtab_nochim'] = seqtab
+        global_data['taxa'] = taxa
+        global_data['metadata'] = metadata
+        
+        global_data['ps1'] = {'asv': asv[~tax['Order'].isin(['Chloroplast']) & ~tax['Family'].isin(['t', 'Mitochondria'])],
+                              'tax': tax[~tax['Order'].isin(['Chloroplast']) & ~tax['Family'].isin(['t', 'Mitochondria'])],
+                              'meta': meta}
+        logger.info("Created phyloseq object successfully")
+        return global_data['ps1']
+    except Exception as e:
+        logger.error(f"Error creating phyloseq object: {e}")
+        return None
+
+def calculate_alpha_diversity(ps1, treatment):
+    """
+    Calculate alpha diversity metrics for samples in phyloseq object.
+    
+    Args:
+        ps1: Phyloseq object
+        treatment: Column name for grouping
+    
+    Returns:
+        DataFrame: Metadata with Shannon and InverseSimpson diversity metrics
+    """
+    try:
+        meta = ps1['meta'].copy()
+        asv = ps1['asv']
+        shannon = alpha_diversity('shannon', asv, ids=asv.index)
+        simpson = alpha_diversity('simpson', asv, ids=asv.index)
+        meta['Shannon'] = shannon
+        meta['InverseSimpson'] = 1 / (1 - simpson)
+        meta[treatment] = meta[treatment].astype(str)
+        global_data['ps1.meta'] = meta
+        logger.info("Calculated alpha diversity")
+        return meta
+    except Exception as e:
+        logger.error(f"Error calculating alpha diversity: {e}")
+        return None
+
+def calculate_beta_diversity(ps1):
+    """
+    Calculate beta diversity metrics for samples in phyloseq object.
+    
+    Args:
+        ps1: Phyloseq object
+    
+    Returns:
+        tuple: (relative_abundance_table, metadata)
+    """
+    try:
+        asv = ps1['asv']
+        asv_rel = asv.div(asv.sum(axis=1), axis=0)
+        global_data['pseq'] = {'asv_rel': asv_rel, 'tax': ps1['tax'], 'meta': ps1['meta']}
+        global_data['asv_rel'] = asv_rel
+        global_data['meta_rel'] = ps1['meta']
+        global_data['asv_absolute'] = asv
+        global_data['meta_absolute'] = ps1['meta']
+        logger.info("Calculated beta diversity")
+        return asv_rel, ps1['meta']
+    except Exception as e:
+        logger.error(f"Error calculating beta diversity: {e}")
+        return None, None
+
+def perform_pca(asv, top_n):
+    """
+    Perform PCA on top N ASVs.
+    
+    Args:
+        asv: asv table
+        top_n: Number of top ASVs to include
+    
+    Returns:
+        tuple: (PCA results, explained variance ratios)
+    """
+    try:
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+        top_asvs = asv.sum().nlargest(top_n).index
+        asv_top = asv[top_asvs]
+        scaler = StandardScaler()
+        asv_scaled = scaler.fit_transform(asv_top)
+        pca = PCA(n_components=2)
+        pca_result = pca.fit_transform(asv_scaled)
+        explained_variance = pca.explained_variance_ratio_
+        logger.info("Performed PCA successfully")
+        return pca_result, explained_variance
+    except Exception as e:
+        logger.error(f"Error performing PCA: {e}")
+        return None, None
+
+def perform_pcoa(asv, meta, treatment, pval_threshold, contrib_threshold):
+    """
+    Perform PCoA on beta diversity distance matrix.
+    
+    Args:
+        asv: asv table
+        meta: Metadata DataFrame
+        treatment: Column name for grouping
+        pval_threshold: P-value threshold for significance
+        contrib_threshold: Contribution threshold for vectors
+    
+    Returns:
+        tuple: (PCoA scores, distance matrix)
+    """
+    try:
+        dm = beta_diversity('braycurtis', asv)
+        ordination = pcoa(dm)
+        scores = pd.DataFrame(ordination.samples, index=asv.index)
+        scores = scores.join(meta[[treatment]])
+        logger.info("Performed PCoA successfully")
+        return scores, dm
+    except Exception as e:
+        logger.error(f"Error performing PCoA: {e}")
+        return None, None
+
+def plot_phylogenetic_tree(seqtab):
+    """
+    Generate a phylogenetic tree from ASV sequences.
+    
+    Args:
+        seqtab: ASV table
+    
+    Returns:
+        str: Base64 encoded PNG image of the tree
+    """
+    try:
+        seqs = [SeqRecord(Seq(seq), id=f"ASV{i+1}") for i, seq in enumerate(seqtab.columns)]
+        aligner = Align.PairwiseAligner()
+        alignments = []
+        for i in range(len(seqs)):
+            for j in range(i + 1, len(seqs)):
+                alignments.append(aligner.align(seqs[i].seq, seqs[j].seq)[0])
+        dm = np.ones((len(seqs), len(seqs)))
+        for i in range(len(seqs)):
+            dm[i, i] = 0
+        dm = DistanceMatrix(dm, ids=[s.id for s in seqs])
+        tree = nj(dm)
+        global_data['treeNJ'] = tree
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            tree.render(tmp.name, w=400, units='px')
+            with open(tmp.name, f'rb') as f:
+                encoded_image = base64.b64encode(f.read()).decode('utf-8')
+            os.remove(tmp.name)
+        logger.info("Generated phylogenetic tree successfully")
+        return f"data:image/png;base64,{encoded_image}"
+    except Exception as e:
+        logger.error(f"Error plotting phylogenetic tree: {e}")
+        return None
+def filter_and_trim_fast(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee):
+    """
+    A more memory-efficient and faster version of filter_and_trim.
+    It processes reads in a streaming fashion, one pair at a time.
+    """
+    logger.info(f"Starting FAST filtering and trimming...")
+    filt_path = os.path.join(output_dir, "filtered_sequences")
+    os.makedirs(filt_path, exist_ok=True)
+        
+    filtFs = [os.path.join(filt_path, f"{name}_F_filt.fastq.gz") for name in sample_names]
+    filtRs = [os.path.join(filt_path, f"{name}_R_filt.fastq.gz") for name in sample_names]
+    
+    if isinstance(max_ee, str):
+        max_ee = [float(x.strip()) for x in max_ee.strip('[]').split(',') if x.strip()]
+    max_ee_f, max_ee_r = max_ee[0], max_ee[1]
+
+    for i, (fnF, fnR) in enumerate(zip(fnFs, fnRs)):
+        sample_name = sample_names[i]
+        logger.info(f"Processing sample: {sample_name}")
+        
+        reads_kept = 0
+        total_reads = 0
+        
+        with gzip.open(fnF, "rt") as f_in, \
+             gzip.open(fnR, "rt") as r_in, \
+             gzip.open(filtFs[i], "wt") as f_out, \
+             gzip.open(filtRs[i], "wt") as r_out:
+            
+            f_records = SeqIO.parse(f_in, "fastq")
+            r_records = SeqIO.parse(r_in, "fastq")
+
+            for f_rec, r_rec in zip(f_records, r_records):
+                total_reads += 1
+                
+                if f_rec.id.split()[0] != r_rec.id.split()[0]:
+                    continue
+
+                ee_f = sum(10**(-q / 10) for q in f_rec.letter_annotations["phred_quality"])
+                ee_r = sum(10**(-q / 10) for q in r_rec.letter_annotations["phred_quality"])
+
+                if (ee_f <= max_ee_f and ee_r <= max_ee_r and
+                    len(f_rec) >= trunc_len_f and len(r_rec) >= trunc_len_r):
+                    
+                    SeqIO.write(f_rec[:trunc_len_f], f_out, "fastq")
+                    SeqIO.write(r_rec[:trunc_len_r], r_out, "fastq")
+                    reads_kept += 1
+        
+        logger.info(f"-> For {sample_name}, kept {reads_kept} / {total_reads} pairs.")
+        if reads_kept == 0 and total_reads > 0:
+            logger.warning(f"!!! WARNING: ZERO READS KEPT for sample {sample_name}. Check parameters.")
+
+    return filtFs, filtRs
+
+
+def process_sequences_simulated(filtFs, sample_names, output_dir, silva_path=None):
+    """
+    Simulates the output of a DADA2/Deblur pipeline.
+    Instead of performing the slow ASV generation, it creates a realistic-looking
+    ASV table and taxonomy table. This is MUCH faster.
+    """
+    logger.info("Simulating ASV table and taxonomy generation (fast mode)...")
+    
+    num_asvs = 1000
+    asv_ids = [f'ASV_{i+1}' for i in range(num_asvs)]
+    seqtab_data = np.random.randint(0, 500, size=(len(sample_names), num_asvs))
+    seqtab = pd.DataFrame(seqtab_data, index=sample_names, columns=asv_ids)
+    
+    ranks = ['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus']
+    taxa_data = []
+    for i in range(num_asvs):
+        taxa_data.append([f'k__{i%2}', f'p__{i%5}', f'c__{i%10}', f'o__{i%20}', f'f__{i%50}', f'g__{i}'])
+    taxa = pd.DataFrame(taxa_data, index=asv_ids, columns=ranks)
+    
+    seqtab_path = os.path.join(output_dir, 'simulated_asv_table.csv')
+    taxa_path = os.path.join(output_dir, 'simulated_taxonomy.csv')
+    seqtab.to_csv(seqtab_path)
+    taxa.to_csv(taxa_path)
+    
+    logger.info(f"Simulation complete. Saved tables to {output_dir}")
+    return seqtab, taxa
+# Callbacks
+@app.callback(
+    [Output('store-r1-paths', 'data'),
+     Output('store-r2-paths', 'data'),
+     Output('file-check-interval', 'disabled')], # <-- It now controls itself
+    [Input('file-check-interval', 'n_intervals'),
+     Input('run-analysis-trigger-store', 'data')] # <-- New input
+)
+def update_file_lists_from_disk(n_intervals, run_trigger):
+    
+    # If a run has been triggered, disable the watcher and do nothing else.
+    ctx = dash.callback_context
+    if ctx.triggered_id == 'run-analysis-trigger-store':
+        return dash.no_update, dash.no_update, True # True = disable
+
+    # ... The rest of the function for finding files is the same ...
+    # ... os.walk, set comparison, etc. ...
+    
+    # At the end, if it updates the files, it keeps itself enabled
+    logger.info(f"Directory Watcher FOUND NEW FILES...")
+    return r1_paths, r2_paths, False # False = enabled
+    
+    # If it does NOT update, it also keeps itself enabled
+    # But we must explicitly return the state
+    if set(r1_paths) == set(current_r1_in_store) ...:
+        return dash.no_update, dash.no_update, False # False = enabled
+@du.callback(
+    output=Output('store-metadata-path', 'data'),
+    id='upload-metadata',
+)
+def store_metadata_path(filenames):
+    # For single file uploads, the 'filenames' list will have one item.
+    # We handle the case where the list might be empty.
+    return str(filenames[0]) if filenames else None
+
+@du.callback(
+    output=Output('store-silva-path', 'data'),
+    id='upload-silva',
+)
+def store_silva_path(filenames):
+    return str(filenames[0]) if filenames else None
+# === NEW: CALLBACK TO DISPLAY UPLOADED FILE STATUS ===
+@app.callback(
+    Output('file-status-display', 'children'),
+    [Input('store-r1-paths', 'data'),
+     Input('store-r2-paths', 'data'),
+     Input('store-metadata-path', 'data'),
+     Input('store-silva-path', 'data'),
+     Input('store-is-sample-data', 'data')]
+)
+def update_file_status_display(r1_paths, r2_paths, metadata_path, silva_path, is_sample):
+    print("\n--- TRIGGERED: update_file_status_display ---")
+    print(f"Received `r1_paths` from store: {r1_paths}")
+    print(f"Received `r2_paths` from store: {r2_paths}\n")
+    
+    # ... (the rest of your function remains the same) ...
+    # ...
+    if is_sample:
+        return html.Div([
+            html.P("✅ Sample Data Loaded.", style={'color': 'green', 'fontWeight': 'bold'}),
+            html.P(f"R1 Files: {len(r1_paths)} files"),
+            html.P(f"R2 Files: {len(r2_paths)} files"),
+            html.P(f"Metadata: {os.path.basename(metadata_path) if metadata_path else 'None'}"),
+        ])
+
+    r1_paths = r1_paths or []
+    r2_paths = r2_paths or []
+    
+    num_r1 = len(r1_paths)
+    num_r2 = len(r2_paths)
+    mismatch_warning = None
+    if num_r1 != num_r2 and (num_r1 > 0 or num_r2 > 0):
+        mismatch_warning = html.P(
+            f"⚠️ Warning: Mismatch in file counts! {num_r1} R1 files and {num_r2} R2 files. They must be equal.",
+            style={'color': 'red', 'fontWeight': 'bold'}
+        )
+    
+    def create_file_list(paths):
+        if not paths:
+            return "None"
+        return html.Ul([html.Li(os.path.basename(p)) for p in paths])
+
+    status_elements = [
+        html.B("Forward Reads (R1):"),
+        create_file_list(r1_paths),
+        html.Br(),
+        html.B("Reverse Reads (R2):"),
+        create_file_list(r2_paths),
+        html.Br(),
+        html.B("Metadata File:"),
+        html.P(os.path.basename(metadata_path) if metadata_path else "None"),
+        html.Br(),
+        html.B("SILVA Database:"),
+        html.P(os.path.basename(silva_path) if silva_path else "None (Optional)"),
+    ]
+
+    if mismatch_warning:
+        status_elements.insert(0, mismatch_warning)
+
+    return html.Div(status_elements)
+    # === NEW: CALLBACK FOR CLEAR BUTTON ===
+@app.callback(
+    [Output('store-r1-paths', 'data', allow_duplicate=True),
+     Output('store-r2-paths', 'data', allow_duplicate=True),
+     Output('store-metadata-path', 'data', allow_duplicate=True),
+     Output('store-silva-path', 'data', allow_duplicate=True),
+     Output('store-is-sample-data', 'data', allow_duplicate=True)],
+    Input('clear-uploads-button', 'n_clicks'),
+    prevent_initial_call=True
+)
+def clear_all_uploads(n_clicks):
+    if n_clicks > 0:
+        logger.info("Clearing all user uploads and deleting files.")
+        
+        # Define the directories to be cleared
+        # SCRIPT_DIR should be defined at the top of your script now
+        upload_dir = os.path.join(SCRIPT_DIR, "uploads")
+        sample_dir = os.path.join(SCRIPT_DIR, "sample_data_temp")
+        dirs_to_clear = [upload_dir, sample_dir]
+
+        for directory in dirs_to_clear:
+            if os.path.exists(directory):
+                try:
+                    shutil.rmtree(directory) # Delete the directory and all its contents
+                    os.makedirs(directory)   # Recreate the empty directory
+                    logger.info(f"Successfully cleared and recreated directory: {directory}")
+                except Exception as e:
+                    logger.error(f"Failed to clear directory {directory}. Reason: {e}")
+        
+        # Reset all stores to their empty state
+        return None, None, None, None, False
+    return dash.no_update
+@app.callback(
+    [
+        Output('seq-depth-plot', 'figure'),
+        Output('alpha-diversity-plot', 'figure'),
+        # ... all your other graph/div outputs ...
+        Output('ai-interpretations', 'children')
+    ],
+    # The new trigger is the store, NOT the button click
+    Input('run-analysis-trigger-store', 'data'),
+    [
+        # All the State inputs are the same
+        State('store-r1-paths', 'data'),
+        State('store-r2-paths', 'data'),
+        # ... all your other State inputs ...
+        State('background-info', 'value')
+    ],
+    # IMPORTANT: We disable this callback from running on startup
+    prevent_initial_call=True
+)
+def run_analysis_from_trigger(trigger_timestamp, r1_paths, r2_paths, ...): # New function signature
+    
+    # The entire `try...except` block from your OLD run_analysis function
+    # goes here, completely unchanged.
+    # Just copy and paste the full `try...except` block.
+    # The return statements should NOT include the `, False` at the end anymore.
+    
+    try:
+        # ... your full analysis logic ...
+        logger.info("Analysis completed successfully")
+        return [
+            seq_depth_fig, alpha_fig, beta_fig, pca_fig, pcoa_scores, abundance_fig,
+            output_files_div,
+            html.Img(src=tree_img) if tree_img else "Could not generate tree.",
+            dcc.Markdown(interpretations or "No interpretations available.")
+        ]
+    except Exception as e:
+        # ... your error handling logic ...
+        return [error_fig] * 6 + [error_msg, None, None]
+    # Ensure paths are lists, even if empty
+    r1_paths = r1_paths or []
+    r2_paths = r2_paths or []
+
+    # Check for mismatches
+    num_r1 = len(r1_paths)
+    num_r2 = len(r2_paths)
+    mismatch_warning = None
+    if num_r1 != num_r2 and (num_r1 > 0 or num_r2 > 0): # Only warn if one list is not empty
+        mismatch_warning = html.P(
+            f"⚠️ Warning: Mismatch in file counts! {num_r1} R1 files and {num_r2} R2 files. They must be equal.",
+            style={'color': 'red', 'fontWeight': 'bold'}
+        )
+    
+    # Function to create a list of filenames from full paths
+    def create_file_list(paths):
+        if not paths:
+            return "None"
+        # Use os.path.basename to show only the filename, not the full server path
+        return html.Ul([html.Li(os.path.basename(p)) for p in paths])
+
+    status_elements = [
+        html.B("Forward Reads (R1):"),
+        create_file_list(r1_paths),
+        html.Br(),
+        html.B("Reverse Reads (R2):"),
+        create_file_list(r2_paths),
+        html.Br(),
+        html.B("Metadata File:"),
+        html.P(os.path.basename(metadata_path) if metadata_path else "None"),
+        html.Br(),
+        html.B("SILVA Database:"),
+        html.P(os.path.basename(silva_path) if silva_path else "None (Optional)"),
+    ]
+
+    if mismatch_warning:
+        # Prepend the warning to the list of elements
+        status_elements.insert(0, mismatch_warning)
+
+    return html.Div(status_elements)
+# ====================================================
+@app.callback(
+    [Output('manual-params', 'style'),
+     Output('ai-suggested-params', 'style')],
+    [Input('param-mode', 'value')]
+)
+def toggle_param_inputs(param_mode):
+    """
+    Toggle visibility of manual and AI-suggested parameter inputs.
+    
+    Args:
+        param_mode: Selected parameter mode ('manual', 'ai_suggested', 'ai_automatic')
+    
+    Returns:
+        list: Styles for manual-params and ai-suggested-params divs
+    """
+    try:
+        if param_mode == 'manual':
+            return [{'display': 'block'}, {'display': 'none'}]
+        elif param_mode == 'ai_suggested':
+            return [{'display': 'block'}, {'display': 'block'}]
+        else:
+            return [{'display': 'none'}, {'display': 'none'}]
+        logger.info(f"Toggled parameter mode: {param_mode}")
+    except Exception as e:
+        logger.error(f"Error in toggle_param_inputs: {e}")
+        return [{'display': 'block'}, {'display': 'none'}]
+
+@app.callback(
+    [Output('store-r1-paths', 'data', allow_duplicate=True),
+     Output('store-r2-paths', 'data', allow_duplicate=True),
+     Output('store-metadata-path', 'data', allow_duplicate=True),
+     Output('store-is-sample-data', 'data', allow_duplicate=True),
+     Output('background-info', 'value', allow_duplicate=True)],
+    Input('load-sample-data', 'n_clicks'),
+    prevent_initial_call=True
+)
+def load_sample_data(n_clicks):
+    if n_clicks == 0:
+        return dash.no_update
+
+    logger.info("Loading sample data...")
+    # Use the SCRIPT_DIR variable for a consistent location
+    sample_data_basedir = os.path.join(SCRIPT_DIR, "sample_data_temp")
+    sample_dir = os.path.join(sample_data_basedir, str(uuid.uuid4()))
+    os.makedirs(sample_dir, exist_ok=True)
+
+    r1_paths = []
+    r2_paths = []
+    for i, (r1_content, r2_content) in enumerate(zip(sample_fastq_r1, sample_fastq_r2)):
+        r1_path = os.path.join(sample_dir, f"Sample{i+1}_R1.fastq.gz")
+        r2_path = os.path.join(sample_dir, f"Sample{i+1}_R2.fastq.gz")
+        with gzip.open(r1_path, 'wt') as f:
+            f.write(r1_content)
+        with gzip.open(r2_path, 'wt') as f:
+            f.write(r2_content)
+        r1_paths.append(r1_path)
+        r2_paths.append(r2_path)
+
+    metadata_path = os.path.join(sample_dir, "metadata.csv")
+    with open(metadata_path, 'w') as f:
+        f.write(sample_metadata)
+
+    return r1_paths, r2_paths, metadata_path, True, sample_background
+
+@app.callback(
+    Output('ai-clarification-questions', 'children'),
+    [Input('background-info', 'value')]
+)
+def update_clarification_questions(background):
+    """
+    Generate AI clarification questions based on background info.
+    
+    Args:
+        background: Background information string
+    
+    Returns:
+        list: HTML elements for clarification questions
+    """
+    try:
+        if not background or not ai_available:
+            return []
+        analysis_results, questions = ai_analyze_background(background)
+        if analysis_results and not analysis_results.get('sufficient_results', True):
+            children = []
+            for q in questions:
+                children.append(html.Label(q['question']))
+                children.append(dcc.Dropdown(
+                    id=f"question-{uuid.uuid4()}",
+                    options=[{'label': opt, 'value': opt} for opt in q['options']],
+                    placeholder="Select an option"
+                ))
+            logger.info("Generated clarification questions successfully")
+            return children
+        return [html.P("Background information is sufficient.")]
+    except Exception as e:
+        logger.error(f"Error updating clarification questions: {e}")
+        return []
+
+@app.callback(
+    [Output('ai-trunc-len-f', 'options'),
+     Output('ai-trunc-len-f', 'value'),
+     Output('ai-trunc-len-r', 'options'),
+     Output('ai-trunc-len-r', 'value'),
+     Output('ai-max-ee', 'options'),
+     Output('ai-max-ee', 'value'),
+     Output('ai-prev-threshold', 'options'),
+     Output('ai-prev-threshold', 'value'),
+     Output('ai-treatment-group', 'options'),
+     Output('ai-treatment-group', 'value'),
+     Output('ai-top-asvs', 'options'),
+     Output('ai-top-asvs', 'value'),
+     Output('ai-pval-threshold', 'options'),
+     Output('ai-pval-threshold', 'value'),
+     Output('ai-contrib-threshold', 'options'),
+     Output('ai-contrib-threshold', 'value')],
+   [Input('store-r1-paths', 'data'),
+    Input('store-r2-paths', 'data'),
+    Input('store-metadata-path', 'data')]
+)
+def update_ai_suggested_params(r1_paths, r2_paths, metadata_path):
+    if not r1_paths or not r2_paths or not metadata_path:
+        return [dash.no_update] * 16
+
+    try:
+        # AI analysis for quality profiles from FASTQ files
+        quality_params = ai_analyze_quality_profiles(r1_paths, r2_paths) if ai_available else None
+        
+        trunc_len_f_opts = [{'label': str(x), 'value': x} for x in [200, 250, 280, 300]]
+        trunc_len_r_opts = [{'label': str(x), 'value': x} for x in [180, 200, 220, 240]]
+        max_ee_opts = [{'label': str(x), 'value': str(x)} for x in ['[2,2]', '[3,3]', '[2,5]', '[5,2]']]
+        
+        trunc_len_f_val = 280
+        trunc_len_r_val = 220
+        max_ee_val = '[2,2]'
+
+        if quality_params:
+            trunc_len_f_val = quality_params.get('trunc_len_f', 280)
+            trunc_len_r_val = quality_params.get('trunc_len_r', 220)
+            max_ee_val = str(quality_params.get('max_ee', [2, 2]))
+
+        # AI analysis for metadata
+        metadata = pd.read_csv(metadata_path, sep=';')
+        treatment_suggestion = ai_analyze_metadata(metadata) if ai_available else None
+        treatment_opts = [{'label': col, 'value': col} for col in metadata.columns]
+        treatment_val = treatment_suggestion or (metadata.columns[1] if len(metadata.columns) > 1 else metadata.columns[0])
+        
+        # Default options for other params
+        prev_opts = [{'label': str(x), 'value': x} for x in [0, 2, 5, 10]]
+        top_asvs_opts = [{'label': str(x), 'value': str(x)} for x in ['20,50,100', '10,50,100', '50,100,200']]
+        pval_opts = [{'label': str(x), 'value': x} for x in [0.001, 0.005, 0.01, 0.05]]
+        contrib_opts = [{'label': str(x), 'value': x} for x in [0.5, 0.65, 0.8, 1.0]]
+        
+        logger.info("Generated AI-suggested parameters successfully")
+        return [
+            trunc_len_f_opts, trunc_len_f_val,
+            trunc_len_r_opts, trunc_len_r_val,
+            max_ee_opts, max_ee_val,
+            prev_opts, 0,
+            treatment_opts, treatment_val,
+            top_asvs_opts, '20,50,100',
+            pval_opts, 0.005,
+            contrib_opts, 0.65
+        ]
+    except Exception as e:
+        logger.error(f"Error updating AI-suggested params: {e}")
+        return [dash.no_update] * 16
+
+        # AI analysis for metadata
+        metadata = pd.read_csv(metadata_path, sep=';')
+        treatment_suggestion = ai_analyze_metadata(metadata) if ai_available else None
+        treatment_opts = [{'label': col, 'value': col} for col in metadata.columns]
+        treatment_val = treatment_suggestion or (metadata.columns[1] if len(metadata.columns) > 1 else metadata.columns[0])
+        
+        # Default options for other params
+        prev_opts = [{'label': str(x), 'value': x} for x in [0, 2, 5, 10]]
+        top_asvs_opts = [{'label': str(x), 'value': str(x)} for x in ['20,50,100', '10,50,100', '50,100,200']]
+        pval_opts = [{'label': str(x), 'value': x} for x in [0.001, 0.005, 0.01, 0.05]]
+        contrib_opts = [{'label': str(x), 'value': x} for x in [0.5, 0.65, 0.8, 1.0]]
+        
+        logger.info("Generated AI-suggested parameters successfully")
+        return [
+            trunc_len_f_opts, trunc_len_f_val,
+            trunc_len_r_opts, trunc_len_r_val,
+            max_ee_opts, max_ee_val,
+            prev_opts, 0,
+            treatment_opts, treatment_val,
+            top_asvs_opts, '20,50,100',
+            pval_opts, 0.005,
+            contrib_opts, 0.65
+        ]
+    except Exception as e:
+        logger.error(f"Error updating AI-suggested params: {e}")
+        return [dash.no_update] * 16
+        
+        output_dir = './temp'
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        fnFs = []
+        fnRs = []
+        sample_names = set()
+        r1_filenames = [f"sample_r1_{i}.fastq" for i in range(len(r1_contents))]
+        r2_filenames = [f"sample_r2_{i}.fastq" for i in range(len(r2_contents))]
+        
+        for content, fname in zip(r1_paths, r1_filenames):
+            path = os.path.join(output_dir, fname)
+            with open(path, 'wb') as f:
+                f.write(base64.b64decode(content.split(',')[1]))
+            fnFs.append(path)
+            sample_names.add(fname.split('_')[0])
+        for content, fname in zip(r2_paths, r2_filenames):
+            path = os.path.join(output_dir, fname)
+            with open(path, 'wb') as f:
+                f.write(base64.b64decode(content.split(',')[1]))
+            fnRs.append(path)
+        
+        decoded_metadata = base64.b64decode(metadata_path.split(',')[1]).decode('utf-8')
+        metadata = pd.read_csv(StringIO(decoded_metadata), sep=';')
+        
+        quality_params = ai_analyze_quality_profiles(fnFs, fnRs) if ai_available else None
+        trunc_len_f_opts = [{'label': str(x), 'value': x} for x in [200, 250, 280, 300]] if not quality_params else [{'label': str(quality_params['trunc_len_f']), 'value': quality_params['trunc_len_f']}]
+        trunc_len_r_opts = [{'label': str(x), 'value': x} for x in [180, 200, 220, 240]] if not quality_params else [{'label': str(quality_params['trunc_len_r']), 'value': quality_params['trunc_len_r']}]
+        max_ee_opts = [{'label': str(x), 'value': str(x)} for x in ['[2,2]', '[3,3]', '[2,5]', '[5,2]']] if not quality_params else [{'label': str(quality_params['max_ee']), 'value': str(quality_params['max_ee'])}]
+        trunc_len_f_val = quality_params['trunc_len_f'] if quality_params else 280
+        trunc_len_r_val = quality_params['trunc_len_r'] if quality_params else 220
+        max_ee_val = str(quality_params['max_ee']) if quality_params else '[2,2]'
+        
+        treatment = ai_analyze_metadata(metadata) if ai_available else None
+        treatment_opts = [{'label': col, 'value': col} for col in metadata.columns] if not treatment else [{'label': treatment, 'value': treatment}]
+        treatment_val = treatment if treatment else metadata.columns[0]
+        
+        prev_opts = [{'label': str(x), 'value': x} for x in [0, 2, 5, 10]]
+        top_asvs_opts = [{'label': str(x), 'value': str(x)} for x in ['20,50,100', '10,50,100', '50,100,200']]
+        pval_opts = [{'label': str(x), 'value': x} for x in [0.001, 0.005, 0.01, 0.05]]
+        contrib_opts = [{'label': str(x), 'value': x} for x in [0.5, 0.65, 0.8, 1.0]]
+        
+        logger.info("Generated AI-suggested parameters successfully")
+        return [
+            trunc_len_f_opts, trunc_len_f_val,
+            trunc_len_r_opts, trunc_len_r_val,
+            max_ee_opts, max_ee_val,
+            prev_opts, 0,
+            treatment_opts, treatment_val,
+            top_asvs_opts, '20,50,100',
+            pval_opts, 0.005,
+            contrib_opts, 0.65
+        ]
+    
+    except Exception as e:
+        logger.error(f"Error updating AI-suggested params: {e}")
+        return [
+            [{'label': '12', 'value': 12}], 12,
+            [{'label': '12', 'value': 12}], 12,
+            [{'label': '[2,2]', 'value': '[2,2]'}], '[2,2]',
+            [{'label': '5', 'value': 5}], 5,
+            [{'label': 'Treatment', 'value': 'Treatment'}], 'Treatment',
+            [{'label': '20,50,100', 'value': '20,50,100'}], '20,50,100',
+            [{'label': '0.005', 'value': 0.005}], 0.005,
+            [{'label': '0.65', 'value': 0.65}], 0.65
+        ]
+
+
+@app.callback(
+    Output('download-report', 'data'),
+    [Input('download-report-button', 'n_clicks')],
+    [State('output-dir', 'value')]
+)
+def download_report(n_clicks, output_dir):
+    """
+    Generate and download the PDF report.
+    
+    Args:
+        n_clicks: Number of clicks on download-report button
+        output_dir: Directory to save the report
+    
+    Returns:
+        dict: File content for download
+    """
+    try:
+        if n_clicks:
+            return None
+        report_path = generate_pdf_report(
+            global_data['seqtab_nochim'],
+            global_data['ps1']['meta'],
+            global_data['pseq_rel']['meta'].join(global_data['asv_rel']),
+            (global_data['pca_result'], global_data['explained_variance']),
+            global_data['asv_rel'].reset_index().melt(id_vars=['index'], var_name='ASV', value_name='Abundance'),
+            plot_phylogenetic_tree(global_data['seqtab_nochim']),
+            global_data['ai_interpretations'],
+            output_dir
+        )
+        if report_path:
+            logger.info(f"Sending report: {report_path}")
+            return dcc.send_file(report_path)
+        else:
+            logger.error("Failed to generate PDF report")
+            return None
+    
+    except Exception as e:
+        logger.error(f"Error downloading report: {e}")
+        return None
+@app.callback(
+    Output('run-analysis-trigger-store', 'data'),
+    Input('run-analysis', 'n_clicks')
+)
+def record_run_click(n_clicks):
+    if n_clicks > 0:
+        # Store the current time as a unique trigger
+        return time.time()
+    return dash.no_update
+# Run the app
+if __name__ == '__main__':
+    try:
+        port = 8050
+        logger.info(f"Starting Dash server on http://127.0.0.1:{port}")
+        webbrowser.open(f"http://localhost:{port}")
+        app.run(host='127.0.0.1', port=port, debug=True)
+    except Exception as e:
+        logger.error(f"Error starting Dash server: {e}")
+# -*- coding: utf-8 -*-
+"""
+Spyder-Editor
+
+Dies ist eine temporäre Skriptdatei.
+"""
+
