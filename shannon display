@@ -1,0 +1,35 @@
+def calculate_alpha_diversity(ps1, treatment):
+    """
+    Calculates Shannon alpha diversity on a sample-by-sample basis.
+    """
+    try:
+        logger.info("Calculating Alpha Diversity...")
+        meta = ps1['meta'].copy()
+        asv_table = ps1['asv'] # Shape is (ASVs, Samples)
+
+        # --- THE FINAL FIX IS HERE ---
+        # We must transpose the table so the samples are rows and ASVs are columns,
+        # which is the format skbio expects for per-sample diversity.
+        asv_table_transposed = asv_table.T # Shape is now (Samples, ASVs)
+        
+        counts_matrix = asv_table_transposed.astype(int).values
+        sample_ids = asv_table_transposed.index
+
+        if asv_table_transposed.empty:
+            logger.warning("ASV table is empty. Cannot calculate alpha diversity.")
+            meta['Shannon'] = 0.0
+            return meta
+
+        # Calculate Shannon diversity using the correctly oriented data
+        shannon_values = alpha_diversity('shannon', counts_matrix, ids=sample_ids)
+        
+        # Add the results back to the original metadata dataframe
+        meta['Shannon'] = shannon_values
+        
+        logger.info("Alpha diversity calculation successful.")
+        return meta
+
+    except Exception as e:
+        logger.error(f"Error in calculate_alpha_diversity: {e}", exc_info=True)
+        meta['Shannon'] = 0.0
+        return meta
