@@ -1,0 +1,127 @@
+import os
+import subprocess
+import logging
+import multiprocessing
+
+logger = logging.getLogger(__name__)
+
+import os
+import subprocess
+import logging
+
+logger = logging.getLogger(__name__)
+
+def run_cutadapt_on_sample(args):
+    """
+    Worker function that runs Cutadapt on a single sample (one pair of reads).
+    This version is CORRECTED and does not use the invalid '-L' argument.
+
+    Args:
+        args (tuple): A tuple containing all the necessary parameters:
+                      (fnF, fnR, sample_name, output_dir, trunc_len_f,
+                       trunc_len_r, quality_cutoff)
+
+    Returns:
+        tuple: A tuple containing the paths to the filtered forward and reverse
+               read files, or (None, None) if the process fails.
+    """
+    # 1. Unpack all the arguments. Note that trunc_len_r will be ignored.
+    fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, quality_cutoff = args
+    
+    # 2. Define the output file paths
+    filtF = os.path.join(output_dir, f"{sample_name}_F_filt.fastq.gz")
+    filtR = os.path.join(output_dir, f"{sample_name}_R_filt.fastq.gz")
+
+    logger.info(f"--- [PID:{os.getpid()}] Starting Cutadapt for sample: '{sample_name}' ---")
+
+    # 3. Construct the CORRECTED Cutadapt command.
+    # We have removed the '-L' and 'trunc_len_r' arguments.
+    command = [
+        'cutadapt',
+        '-q', str(quality_cutoff),      # Trim low-quality bases from the 3' end (applied to both reads)
+        '--minimum-length', '25',       # Discard pairs if either read becomes too short
+        
+        # The --length option applies ONLY to the first read (R1)
+        '--length', str(trunc_len_f),   # Truncate forward reads to a fixed length
+        
+        '-o', filtF,                    # Output path for forward reads
+        '-p', filtR,                    # Output path for reverse reads (enables paired-end mode)
+        fnF,                            # Input forward reads
+        fnR                             # Input reverse reads
+    ]
+
+    try:
+        # 4. Run the command using subprocess
+        result = subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
+        
+        logger.info(f"Cutadapt report for '{sample_name}':\n{result.stdout.strip()}")
+        
+        if result.stderr:
+            logger.warning(f"Cutadapt warnings for '{sample_name}':\n{result.stderr.strip()}")
+            
+        return (filtF, filtR)
+
+    except FileNotFoundError:
+        logger.error("`cutadapt` command not found. Is it installed and accessible in the environment's PATH?")
+        raise
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Cutadapt failed for sample '{sample_name}' with exit code {e.returncode}.")
+        logger.error(f"Command run: {' '.join(command)}")
+        logger.error(f"Cutadapt Error Output:\n{e.stderr.strip()}")
+        return (None, None)
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while processing '{sample_name}': {e}")
+        return (None, None)
+
+
+def filter_and_trim_parallel(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, quality_cutoff=20):
+
+    filt_path = os.path.join(output_dir, "filtered_sequences")
+    os.makedirs(filt_path, exist_ok=True)
+
+    # Prepare the list of arguments for each parallel job.
+    # Each item in the list is a tuple containing all args for one call to the worker function.
+    args_list = [
+        (fnF, fnR, name, filt_path, trunc_len_f, trunc_len_r, quality_cutoff)
+        for fnF, fnR, name in zip(fnFs, fnRs, sample_names)
+    ]
+
+    # Determine the number of processes to use.
+    # Using one less than the total number of CPUs is a good default to keep the system responsive.
+    num_processes = max(1, multiprocessing.cpu_count() - 1)
+    logger.info(f"Starting parallel processing with {num_processes} worker processes.")
+
+    filtFs_out = []
+    filtRs_out = []
+    
+    # The 'with' statement ensures the pool of processes is properly shut down.
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        # pool.map applies the worker function to each item in args_list.
+        # It blocks until all jobs are complete and returns a list of the results.
+        results = pool.map(run_cutadapt_on_sample, args_list)
+
+    # Process the results from all the worker jobs
+    all_jobs_succeeded = True
+    for res in results:
+        if res and res[0] and res[1]:
+            # If the job was successful, res will be a tuple of paths
+            filtFs_out.append(res[0])
+            filtRs_out.append(res[1])
+        else:
+            # If the job failed, res will be (None, None)
+            all_jobs_succeeded = False
+
+    if not all_jobs_succeeded:
+        logger.error("One or more samples failed during Cutadapt processing. Check logs above for details.")
+    
+    if len(filtFs_out) != len(fnFs):
+         logger.warning("The number of output files does not match the number of input files. Some samples may have failed.")
+
+    if not filtFs_out:
+        logger.error("No samples were processed successfully. Aborting.")
+        return None, None
+
+    logger.info("Parallel Cutadapt processing completed.")
+    return filtFs_out, filtRs_out
