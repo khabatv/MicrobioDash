@@ -35,6 +35,8 @@ import logging
 import io
 import re
 from Bio import Phylo
+import multiprocessing
+from filter_and_trim_function import filter_and_trim_parallel
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -138,28 +140,43 @@ app.layout = html.Div([
         value='manual',
         clearable=False
     ),
-    
+    html.H3("Analysis Starting Point"),
+dcc.RadioItems(
+    id='analysis-mode',
+    options=[
+        {'label': 'Start from raw FASTQ files (Slow, run first)', 'value': 'fastq'},
+        {'label': 'Start from Processed ASV/Taxonomy Tables (Fast)', 'value': 'asv'}
+    ],
+    value='fastq', # Default to starting from scratch
+    labelStyle={'display': 'block'}
+),
+html.Br(),
     # Parameter Tuning
-    html.Div(id='manual-params', children=[
-        html.H3("Analysis Parameters"),
+   html.Div(id='manual-params', children=[
+    html.H3("Analysis Parameters"),
+
+    # This is the new wrapper div we are adding
+    html.Div(id='preprocessing-params-div', children=[
+        html.H4("Pre-processing Parameters (for FASTQ mode)", style={'color': '#555'}),
         html.Label("Truncation Length Forward (e.g., 280):"),
         dcc.Input(id='trunc-len-f', value=280, type='number'),
         html.Label("Truncation Length Reverse (e.g., 220):"),
         dcc.Input(id='trunc-len-r', value=220, type='number'),
         html.Label("Max Expected Errors (Forward, Reverse):"),
         dcc.Input(id='max-ee', value='2,2', type='text'),
-        html.Label("Detection Threshold for Prevalence Filtering:"),
-        dcc.Input(id='prev-threshold', value=0, type='number'),
-        html.Label("Treatment Group Column:"),
-        dcc.Input(id='treatment-group', value='Treatment', type='text'),
-        html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
-        dcc.Input(id='top-asvs', value='20,50,100', type='text'),
-        html.Label("P-Value Threshold for PCoA Vectors:"),
-        dcc.Input(id='pval-threshold', value=0.005, type='number'),
-        html.Label("Contribution Threshold for PCoA Vectors:"),
-        dcc.Input(id='contrib-threshold', value=0.65, type='number'),
     ]),
-    
+    html.H4("Downstream Analysis Parameters", style={'color': '#555'}), # Header for clarity
+    html.Label("Detection Threshold for Prevalence Filtering:"),
+    dcc.Input(id='prev-threshold', value=0, type='number'),
+    html.Label("Treatment Group Column:"),
+    dcc.Input(id='treatment-group', value='Treatment', type='text'),
+    html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
+    dcc.Input(id='top-asvs', value='20,50,100', type='text'),
+    html.Label("P-Value Threshold for PCoA Vectors:"),
+    dcc.Input(id='pval-threshold', value=0.005, type='number'),
+    html.Label("Contribution Threshold for PCoA Vectors:"),
+    dcc.Input(id='contrib-threshold', value=0.65, type='number'),
+]),
     html.Div(id='ai-suggested-params', style={'display': 'none'}, children=[
         html.H3("AI-Suggested Parameters"),
         html.Button('Suggest AI Parameters', id='suggest-ai-params-button', n_clicks=0),
@@ -471,77 +488,100 @@ def unzip_files(uploaded_files, output_dir):
     except Exception as e:
         logger.error(f"Error unzipping files: {e}")
 
+def _filter_and_trim_worker(args):
+
+    fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, max_ee = args
+    filt_path = os.path.join(output_dir, "filtered_sequences")
+    filtF = os.path.join(filt_path, f"{sample_name}_F_filt.fastq.gz")
+    filtR = os.path.join(filt_path, f"{sample_name}_R_filt.fastq.gz")
+
+    logger.info(f"--- Processing sample '{sample_name}' from files: {os.path.basename(fnF)} & {os.path.basename(fnR)} ---")
+
+    try:
+        # Open input files (handles .gz or plain text)
+        open_f = gzip.open if fnF.lower().endswith('.gz') else open
+        open_r = gzip.open if fnR.lower().endswith('.gz') else open
+
+        with open_f(fnF, 'rt') as f_in, open_r(fnR, 'rt') as r_in:
+            records_f_iter = SeqIO.parse(f_in, 'fastq')
+            records_r_iter = SeqIO.parse(r_in, 'fastq')
+
+            kept_records_f = []
+            kept_records_r = []
+            initial_count = 0
+
+            for rec_f, rec_r in zip(records_f_iter, records_r_iter):
+                initial_count += 1
+                if (len(rec_f) >= trunc_len_f and
+                    len(rec_r) >= trunc_len_r and
+                    np.mean(rec_f.letter_annotations['phred_quality']) >= 30 and
+                    np.mean(rec_r.letter_annotations['phred_quality']) >= 30):
+
+                    kept_records_f.append(rec_f[:trunc_len_f])
+                    kept_records_r.append(rec_r[:trunc_len_r])
+
+        final_count = len(kept_records_f)
+        if initial_count > 0:
+            logger.info(f"[{sample_name}] Initial read pairs: {initial_count}")
+            logger.info(f"[{sample_name}] Read pairs remaining after filtering: {final_count} ({final_count/initial_count:.2%})")
+        else:
+            logger.warning(f"[{sample_name}] No read pairs found in the input files.")
+            return None, None
+
+
+        if not kept_records_f:
+            logger.error(f"[{sample_name}] Zero read pairs remaining after filtering. Check truncation lengths and data quality.")
+            return None, None
+
+        with gzip.open(filtF, 'wt') as f_out:
+            SeqIO.write(kept_records_f, f_out, 'fastq')
+        with gzip.open(filtR, 'wt') as r_out:
+            SeqIO.write(kept_records_r, r_out, 'fastq')
+
+        return filtF, filtR
+
+    except Exception as e:
+        logger.error(f"Error processing sample {sample_name}: {e}", exc_info=True)
+        return None, None
+
 def filter_and_trim(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee):
     """
-    Filter and trim FASTQ sequences as PAIRS. A read pair is kept only if BOTH
-    the forward and reverse reads pass the quality and length filters.
-    This ensures that the output files remain synchronized for merging.
+    Filter and trim FASTQ sequences in parallel using a multiprocessing Pool.
     """
     try:
         filt_path = os.path.join(output_dir, "filtered_sequences")
         if not os.path.exists(filt_path):
             os.makedirs(filt_path)
-        filtFs = [os.path.join(filt_path, f"{name}_F_filt.fastq.gz") for name in sample_names]
-        filtRs = [os.path.join(filt_path, f"{name}_R_filt.fastq.gz") for name in sample_names]
-        
+
         if not fnFs or not fnRs:
             logger.error("filter_and_trim was called with empty file lists (fnFs or fnRs).")
             return None, None
 
-        for i, (fnF, fnR, filtF, filtR) in enumerate(zip(fnFs, fnRs, filtFs, filtRs)):
-            sample_name = sample_names[i]
-            logger.info(f"--- Processing sample '{sample_name}' from files: {os.path.basename(fnF)} & {os.path.basename(fnR)} ---")
+        # Prepare arguments for each worker process
+        args_list = [
+            (fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, max_ee)
+            for fnF, fnR, sample_name in zip(fnFs, fnRs, sample_names)
+        ]
 
-            # Open input files (handles .gz or plain text)
-            open_f = gzip.open if fnF.lower().endswith('.gz') else open
-            open_r = gzip.open if fnR.lower().endswith('.gz') else open
-            
-            with open_f(fnF, 'rt') as f_in, open_r(fnR, 'rt') as r_in:
-                # Use SeqIO.parse to create iterators, which is memory-efficient
-                records_f_iter = SeqIO.parse(f_in, 'fastq')
-                records_r_iter = SeqIO.parse(r_in, 'fastq')
-                
-                # These lists will store the reads that pass the paired filter
-                kept_records_f = []
-                kept_records_r = []
-                
-                initial_count = 0
-                
-                # Iterate through both files simultaneously
-                for rec_f, rec_r in zip(records_f_iter, records_r_iter):
-                    initial_count += 1
-                    
-                    # --- THE CRITICAL PAIRED FILTERING LOGIC ---
-                    # A pair is kept only if BOTH reads meet the criteria.
-                    if (len(rec_f) >= trunc_len_f and 
-                        len(rec_r) >= trunc_len_r and
-                        np.mean(rec_f.letter_annotations['phred_quality']) >= 30 and
-                        np.mean(rec_r.letter_annotations['phred_quality']) >= 30):
-                        
-                        # If the pair passes, add BOTH reads to our 'kept' lists
-                        # and perform truncation.
-                        kept_records_f.append(rec_f[:trunc_len_f])
-                        kept_records_r.append(rec_r[:trunc_len_r])
+        # Use a multiprocessing Pool to process files in parallel
+        # We wrap this in a `if __name__ == '__main__':` block in the main script
+        # to ensure it works correctly on all platforms (especially Windows).
+        with multiprocessing.Pool() as pool:
+            results = pool.map(_filter_and_trim_worker, args_list)
 
-            final_count = len(kept_records_f)
-            logger.info(f"[{sample_name}] Initial read pairs: {initial_count}")
-            logger.info(f"[{sample_name}] Read pairs remaining after filtering: {final_count} ({final_count/initial_count:.2%})")
+        # Process the results to separate the filtered file paths
+        filtFs = [res[0] for res in results if res and res[0]]
+        filtRs = [res[1] for res in results if res and res[1]]
 
-            if not kept_records_f: # This also implies kept_records_r is empty
-                logger.error(f"[{sample_name}] Zero read pairs remaining after filtering. Check truncation lengths and data quality. Aborting.")
-                return None, None
+        if not filtFs or not filtRs or len(filtFs) != len(filtRs):
+            logger.error("Parallel filtering and trimming failed to produce valid output for some samples. Aborting.")
+            return None, None
 
-            # Write the synchronized, filtered, and truncated reads to new gzipped files
-            with gzip.open(filtF, 'wt') as f_out:
-                SeqIO.write(kept_records_f, f_out, 'fastq')
-            with gzip.open(filtR, 'wt') as r_out:
-                SeqIO.write(kept_records_r, r_out, 'fastq')
-                
-        logger.info(f"Successfully filtered and trimmed all sequences to: {filt_path}")
+        logger.info(f"Successfully filtered and trimmed all sequences in parallel to: {filt_path}")
         return filtFs, filtRs
-        
+
     except Exception as e:
-        logger.error(f"Error filtering and trimming sequences: {e}", exc_info=True)
+        logger.error(f"Error in parallel filtering and trimming orchestrator: {e}", exc_info=True)
         return None, None
 
 from collections import defaultdict
@@ -1217,7 +1257,22 @@ def update_ai_suggested_params(n_clicks, data_folder_path):
             [{'label': '0.005', 'value': 0.005}], 0.005,
             [{'label': '0.65', 'value': 0.65}], 0.65
         ]
-
+@app.callback(
+    Output('preprocessing-params-div', 'style'),
+    Input('analysis-mode', 'value')
+)
+def toggle_preprocessing_params(analysis_mode):
+    """
+    This function listens for a click on the 'Analysis Starting Point' radio button.
+    If the user selects 'asv' mode, it hides the pre-processing parameters.
+    If the user selects 'fastq' mode, it shows them again.
+    """
+    if analysis_mode == 'fastq':
+        # Show the div by returning a normal style dictionary
+        return {'display': 'block'}
+    else:
+        # Hide the div by setting its display style to 'none'
+        return {'display': 'none'}
 @app.callback(
     [Output('seq-depth-plot', 'figure'),
      Output('alpha-diversity-plot', 'figure'),
@@ -1230,6 +1285,7 @@ def update_ai_suggested_params(n_clicks, data_folder_path):
      Output('ai-interpretations', 'children')],
     [Input('run-analysis', 'n_clicks')],
     [
+     State('analysis-mode', 'value'),
      State('data-folder-path', 'value'),
      State('upload-silva', 'contents'),
      State('output-dir', 'value'),
@@ -1254,7 +1310,7 @@ def update_ai_suggested_params(n_clicks, data_folder_path):
     ],
     prevent_initial_call=True
 )
-def run_analysis(n_clicks, data_folder_path, silva_content, output_dir, param_mode,
+def run_analysis(n_clicks, analysis_mode, data_folder_path, silva_content, output_dir, param_mode,
                  trunc_len_f, trunc_len_r, max_ee_str, prev_threshold, treatment, top_asvs, pval_threshold, contrib_threshold,
                  ai_trunc_len_f, ai_trunc_len_r, ai_max_ee, ai_prev_threshold, ai_treatment, ai_top_asvs, ai_pval_threshold, ai_contrib_threshold,
                  background):
@@ -1271,77 +1327,87 @@ def run_analysis(n_clicks, data_folder_path, silva_content, output_dir, param_mo
             taxa = sample_taxa
             metadata = pd.read_csv(StringIO(sample_metadata))  
             metadata.set_index('SampleID', inplace=True)
-            
         else:
-            # --- CASE 2: PROCESS REAL DATA FROM FOLDER ---
-            logger.info(f"Data folder path provided: '{data_folder_path}'. Reading files from disk.")
-            if not os.path.isdir(data_folder_path):
-                raise ValueError(f"The provided data folder path does not exist or is not a directory: {data_folder_path}")
-        
-            all_files = os.listdir(data_folder_path)
+    # --- CASE 2: PROCESS REAL DATA FROM FOLDER ---
+          logger.info(f"Data folder path provided: '{data_folder_path}'. Reading files from disk.")
+        if not os.path.isdir(data_folder_path):
+            raise ValueError(f"The provided data folder path does not exist or is not a directory: {data_folder_path}")
+    
+        all_files = os.listdir(data_folder_path)
+        meta_files = sorted([os.path.join(data_folder_path, f) for f in all_files if f.lower().endswith(('.csv', '.tsv'))])
+        if not meta_files: raise ValueError("Could not find a metadata file in the specified folder.")
+    
+        # Load the full metadata file first, as it's needed for both modes
+        metadata_df = pd.read_csv(meta_files[0])
+        sample_id_col = metadata_df.columns[0]
+        metadata_df[sample_id_col] = metadata_df[sample_id_col].astype(str)
+        metadata_df.set_index(sample_id_col, inplace=True)
+        metadata_df.index = metadata_df.index.astype(str) # <-- ADD THIS LINE
+        # --- HERE IS THE NEW CORE LOGIC ---
+        if analysis_mode == 'fastq':
+            # --- THIS IS THE "SLOW PATH" ---
+            logger.info("Mode selected: Starting from raw FASTQ files.")
             
-            def natural_sort_key(s):
-                return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
-        
-            fnFs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R1' in f.upper() and f.lower().endswith(('.fastq', '.fastq.gz'))], key=natural_sort_key)
-            fnRs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R2' in f.upper() and f.lower().endswith(('.fastq', '.fastq.gz'))], key=natural_sort_key)
-            meta_files = sorted([os.path.join(data_folder_path, f) for f in all_files if f.lower().endswith(('.csv', '.tsv'))])
-        
-            if not fnFs or not fnRs or not meta_files:
-                raise ValueError("Could not find R1, R2, and metadata files in the specified folder.")
-        
+            # This is your original code, now moved inside this 'if' block
+            fnFs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R1' in f.upper()])
+            fnRs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R2' in f.upper()])
+            
             sample_names_from_files = [os.path.basename(f).split('_')[0] for f in fnFs]
-            
-            metadata_df = pd.read_csv(meta_files[0])
-            sample_id_col = metadata_df.columns[0]
-            metadata_df[sample_id_col] = metadata_df[sample_id_col].astype(str)
-            metadata_df.set_index(sample_id_col, inplace=True)
-            
-            # Reorder metadata to match fastq file order
-            metadata = metadata_df.loc[sample_names_from_files].copy()
+            metadata = metadata_df.loc[sample_names_from_files].copy() # Align metadata to the order of FASTQ files
             sample_names = metadata.index.tolist()
             
-            # --- Parameter Selection for real data ---
-            if param_mode == 'ai_automatic':
-                quality_params = ai_analyze_quality_profiles(fnFs, fnRs) if ai_available else None
-                trunc_len_f = quality_params['trunc_len_f'] if quality_params else 280
-                trunc_len_r = quality_params['trunc_len_r'] if quality_params else 220
-                max_ee = quality_params['max_ee'] if quality_params else [2, 2]
-                treatment = ai_analyze_metadata(metadata) or treatment if ai_available else treatment
-            elif param_mode == 'ai_suggested':
-                # Use AI suggestions if available, otherwise fall back to manual
-                trunc_len_f = ai_trunc_len_f if ai_trunc_len_f is not None else trunc_len_f
-                # ... and so on for all other parameters ...
-            
-            try:
-                max_ee = [float(x.strip()) for x in str(max_ee_str).strip('[]').split(',') if x.strip()]
-            except (ValueError, AttributeError):
-                raise ValueError(f"Invalid format for Max EE. Got: {max_ee_str}")
-
-            # --- Denoising and Taxonomy Assignment for real data ---
+            # Parse parameters
+            max_ee = [float(x.strip()) for x in str(max_ee_str).strip('[]').split(',') if x.strip()]
+    
+            # Your original pre-processing steps
+            filtFs, filtRs = filter_and_trim_parallel(
+                fnFs=fnFs,
+                fnRs=fnRs,
+                sample_names=sample_names,
+                output_dir=output_dir,
+                trunc_len_f=trunc_len_f,
+                trunc_len_r=trunc_len_r,
+                quality_cutoff=20)  # A standard quality cutoff, you can make this a user parameter if you wish)
+            if not filtFs or not filtRs:
+                raise ValueError("Parallel filtering and trimming with Cutadapt failed. Check the console logs for detailed errors.")
+    
+            seqtab = denoise_and_create_asv_table_vsearch(filtFs, filtRs, sample_names, output_dir)
+            if seqtab is None or seqtab.empty: raise ValueError("vsearch failed to create an ASV table.")
+    
+            asv_fasta_path = os.path.join(output_dir, 'asvs.fa')
+            # Your logic for finding the SILVA file
             silva_path = None
             if silva_content:
-                # Logic to save uploaded SILVA file
                 content_type, content_string = silva_content.split(',')
                 decoded = base64.b64decode(content_string)
                 silva_path = os.path.join(output_dir, 'uploaded_silva.fasta')
-                with open(silva_path, 'wb') as f:
-                    f.write(decoded)
+                with open(silva_path, 'wb') as f: f.write(decoded)
             elif os.path.exists(os.path.join(data_folder_path, 'silva.fasta')):
                 silva_path = os.path.join(data_folder_path, 'silva.fasta')
-
-            filtFs, filtRs = filter_and_trim(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee)
-            if not filtFs or not filtRs:
-                raise ValueError("Failed to filter and trim sequences.")
-
-            seqtab = denoise_and_create_asv_table_vsearch(filtFs, filtRs, sample_names, output_dir)
-            if seqtab is None or seqtab.empty:
-                raise ValueError("vsearch failed to create an ASV table.")
-
-            asv_fasta_path = os.path.join(output_dir, 'asvs.fa')
+    
             taxa = assign_taxonomy(list(seqtab.columns), asv_fasta_path, silva_path, output_dir)
-            if taxa is None or taxa.empty:
-                raise ValueError("Failed to assign taxonomy.")
+            if taxa is None or taxa.empty: raise ValueError("Failed to assign taxonomy.")
+    
+        else:
+            # --- THIS IS THE "FAST PATH" ---
+            logger.info("Mode selected: Starting from Processed ASV and Taxonomy Tables.")
+            
+            # Define the paths to the files we expect to find
+            asv_path = os.path.join(output_dir, 'microbiome_ai_16s_asv.csv')
+            taxa_path = os.path.join(output_dir, 'microbiome_ai_taxonomy.csv')
+    
+            if not os.path.exists(asv_path) or not os.path.exists(taxa_path):
+                raise FileNotFoundError(f"Processed files not found in '{output_dir}'. Please run the analysis in 'From FASTQ files' mode first.")
+    
+            # Load the tables directly from disk
+            seqtab = pd.read_csv(asv_path, sep='\t', index_col=0)
+            taxa = pd.read_csv(taxa_path, index_col=0)
+            seqtab.index = seqtab.index.astype(str)
+            metadata_df.index = metadata_df.index.astype(str)
+            # Align the full metadata to the samples in our loaded ASV table
+            metadata = metadata_df.loc[seqtab.index].copy()
+            logger.info(f"Successfully loaded ASV table ({seqtab.shape}) and Taxonomy table ({taxa.shape}).")
+
 
         # --- SHARED ANALYSIS PIPELINE (runs for both sample and real data) ---
         
@@ -1455,3 +1521,6 @@ if __name__ == '__main__':
         app.run(host='127.0.0.1', port=port, debug=True)
     except Exception as e:
         logger.error(f"Error starting Dash server: {e}")
+        
+if __name__ == '__main__':
+    app.run_server(debug=True)
