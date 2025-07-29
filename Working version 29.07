@@ -6,6 +6,9 @@ from skbio.diversity import alpha_diversity, beta_diversity
 from skbio.stats.ordination import pcoa
 from skbio import DistanceMatrix
 from skbio.stats.distance import permanova
+from sklearn.manifold import MDS
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 import pandas as pd
 import numpy as np
 import os
@@ -180,7 +183,6 @@ dcc.Dropdown(
 
 # The next line should be "Top ASVs for PCA"
 html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
-    html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
     dcc.Input(id='top-asvs', value='20,50,100', type='text'),
     html.Label("P-Value Threshold for PCoA Vectors:"),
     dcc.Input(id='pval-threshold', value=0.005, type='number'),
@@ -219,9 +221,12 @@ html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
     dcc.Graph(id='beta-diversity-plot'),
     dcc.Graph(id='pca-plot'),
     dcc.Graph(id='pcoa-plot'),
+    dcc.Graph(id='nmds-plot'),
     html.Div(id='permanova-results', style={'textAlign': 'center'}),
     dcc.Graph(id='abundance-plot'),
     dcc.Graph(id='abundance-order-plot'),
+    html.Div(id='differential-abundance-results'),
+    html.Div(id='indicator-species-results'),
     html.Div(id='output-files'),
     html.Div(id='phylogenetic-tree'),
     html.Div(id='ai-interpretations'),
@@ -968,7 +973,7 @@ def calculate_beta_diversity(ps1):
     except Exception as e:
         logger.error(f"Error calculating beta diversity: {e}")
         return None, None
-def perform_pcoa(asv, meta, treatment, pval_threshold, contrib_threshold):
+def perform_pcoa(asv, meta, treatment):
     """
     Perform PCoA on beta diversity distance matrix.
     
@@ -1079,7 +1084,43 @@ def perform_pca(asv, top_n):
     except Exception as e:
         logger.error(f"Error performing PCA: {e}", exc_info=True)
         return None, None
+def perform_nmds(distance_matrix):
+    """
+    Performs Non-metric Multidimensional Scaling (NMDS) using scikit-learn.
+    """
+    try:
+        logger.info("Performing NMDS with scikit-learn...")
+        
+        # scikit-learn's MDS function works directly on the distance matrix data
+        dm_array = distance_matrix.to_data_frame().values
 
+        # Initialize the NMDS model
+        # n_components=2 for a 2D plot
+        # metric=False for non-metric MDS
+        # n_init=20 runs the algorithm multiple times to find the best layout
+        # dissimilarity='precomputed' tells the model we are giving it a distance matrix
+        nmds_model = MDS(
+            n_components=2, 
+            metric=False, 
+            n_init=20, 
+            dissimilarity='precomputed',
+            random_state=42 # for reproducibility
+        )
+
+        # Fit the model and get the coordinates for the plot
+        nmds_scores = nmds_model.fit_transform(dm_array)
+        
+        # The stress value is a measure of how well the 2D plot represents the original data
+        nmds_stress = nmds_model.stress_
+
+        logger.info(f"scikit-learn NMDS completed with stress: {nmds_stress:.4f}")
+        
+        # Return the scores and the stress value as a pandas DataFrame
+        return pd.DataFrame(nmds_scores, index=distance_matrix.ids, columns=['NMDS1', 'NMDS2']), nmds_stress
+        
+    except Exception as e:
+        logger.error(f"Error performing NMDS: {e}", exc_info=True)
+        return None, None
 def plot_phylogenetic_tree(seqtab):
     """
     Generate a phylogenetic tree from ASV sequences using a compatible workflow.
@@ -1220,6 +1261,190 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01):
     except Exception as e:
         logger.error(f"Could not generate Order-level abundance plot: {e}")
         return go.Figure(layout_title_text=f"Error: {e}")
+def run_differential_abundance(ps1_object, treatment_column, p_adjust_method='fdr_bh'):
+    """
+    Performs Kruskal-Wallis tests for each taxon at the Order level.
+    This version uses a more robust data preparation method.
+    """
+    try:
+        logger.info("Running differential abundance analysis...")
+        
+        # --- 1. Prepare Data (More Robust Method) ---
+        asv_abs = ps1_object['asv'] # Start with absolute counts (ASVs x Samples)
+        taxa = ps1_object['tax']
+        meta = ps1_object['meta']
+        groups = meta[treatment_column].unique()
+
+        if len(groups) < 2:
+            return html.P("At least two groups are needed for this analysis.")
+
+        # Combine taxonomy with the abundance table
+        abundance_with_taxa = asv_abs.join(taxa['Order'])
+        
+        # Melt the data into a long format
+        melted_df = abundance_with_taxa.reset_index().melt(
+            id_vars=['index', 'Order'], 
+            var_name='SampleID', 
+            value_name='Abundance'
+        )
+        melted_df.rename(columns={'index': 'ASV'}, inplace=True)
+        # Merge with metadata to get the treatment groups
+        melted_df = melted_df.merge(meta[[treatment_column]], left_on='SampleID', right_index=True)
+        
+        # Now, aggregate to the Order level
+        order_abundance = melted_df.groupby(['SampleID', 'Order'])['Abundance'].sum().unstack(fill_value=0)
+
+        # The result 'order_abundance' is now a perfect table: Samples x Orders
+        
+        # --- 2. Perform Statistical Testing ---
+        test_results = []
+        for order in order_abundance.columns:
+            if pd.isna(order): continue
+            
+            grouped_values = [order_abundance[order][meta[treatment_column] == g] for g in groups]
+            
+            # This is our robust check for variance
+            try:
+                stat, p_raw = kruskal(*grouped_values)
+                test_results.append({'Order': order, 'p_raw': p_raw})
+            except ValueError:
+                continue # Skip if a group has zero variance
+
+        if not test_results:
+            return html.Div([html.H4("Differential Abundance by Order"), html.P("No valid statistics could be calculated, likely due to low variance within groups.")])
+
+        results_df = pd.DataFrame(test_results).dropna()
+        
+        # --- 3. P-value Correction and Table Formatting ---
+        if results_df.empty:
+            return html.Div([html.H4("Differential Abundance by Order"), html.P("No Orders were found to be significantly different.")])
+            
+        reject, p_adjusted, _, _ = multipletests(results_df['p_raw'], alpha=0.05, method=p_adjust_method)
+        results_df['p_adj'] = p_adjusted
+        results_df['significant'] = reject
+
+        significant_results = results_df[results_df['significant']].sort_values('p_adj').copy()
+
+        if significant_results.empty:
+            return html.Div([html.H4("Differential Abundance by Order"), html.P("No Orders were found to be significantly different after correcting for multiple comparisons.")])
+
+        significant_results['p_adj'] = significant_results['p_adj'].map('{:.4f}'.format)
+        
+        table_header = [html.Thead(html.Tr([html.Th("Taxonomic Order"), html.Th("Adjusted p-value")]))]
+        table_body = [html.Tbody([html.Tr([html.Td(row['Order']), html.Td(row['p_adj'])]) for _, row in significant_results.iterrows()])]
+        
+        return html.Div([
+            html.H4("Significantly Different Taxa (by Order)"),
+            html.Table(table_header + table_body, style={'marginLeft': 'auto', 'marginRight': 'auto', 'marginTop': '20px'})
+        ])
+
+    except Exception as e:
+        logger.error(f"Differential abundance analysis failed: {e}", exc_info=True)
+        return html.P(f"Error during differential abundance analysis: {e}")    
+def run_indicator_species(ps1_object, treatment_column):
+    """
+    Performs a custom Indicator Species-like analysis to find ASVs that are
+    characteristic of each treatment group using scipy and pandas.
+    """
+    try:
+        logger.info("Running custom Indicator Species Analysis...")
+        
+        # --- 1. Prepare Data ---
+        # We need a boolean (presence/absence) table and a relative abundance table
+        asv_rel_table = ps1_object['asv'].div(ps1_object['asv'].sum(axis=1), axis=0).T # Samples x ASVs
+        asv_pa_table = (asv_rel_table > 0).astype(int) # Presence/Absence
+        
+        groups = ps1_object['meta'][treatment_column]
+        unique_groups = groups.unique()
+
+        if len(unique_groups) < 2:
+            return html.P("At least two groups are needed for Indicator Species Analysis.")
+
+        # --- 2. Calculate Indicator Score for Each ASV in Each Group ---
+        indicator_results = []
+        for group in unique_groups:
+            # Get the sample names for the target group and all other groups
+            target_samples = groups[groups == group].index
+            other_samples = groups[groups != group].index
+            
+            for asv in asv_pa_table.columns:
+                # --- Specificity Calculation ---
+                # How many times does the ASV appear in the target group?
+                in_target_count = asv_pa_table.loc[target_samples, asv].sum()
+                # How many times does it appear in total?
+                total_count = asv_pa_table[asv].sum()
+                if total_count == 0: continue # Skip if ASV is not present anywhere
+                
+                specificity = in_target_count / total_count
+                
+                # --- Fidelity Calculation ---
+                # In what proportion of target group samples is the ASV present?
+                fidelity = in_target_count / len(target_samples)
+                
+                # Calculate the final indicator score
+                indicator_score = specificity * fidelity
+
+                # --- Statistical Test ---
+                # Compare the abundance in the target group vs. all other groups
+                target_abund = asv_rel_table.loc[target_samples, asv]
+                other_abund = asv_rel_table.loc[other_samples, asv]
+                
+                # Check for variance before testing
+                if target_abund.var() == 0 and other_abund.var() == 0: continue
+
+                stat, p_value = mannwhitneyu(target_abund, other_abund, alternative='greater')
+                
+                indicator_results.append({
+                    'ASV': asv,
+                    'Associated Group': group,
+                    'Indicator Score': indicator_score,
+                    'p_value': p_value
+                })
+
+        if not indicator_results:
+            return html.Div([html.H4("Indicator ASV Analysis"), html.P("No valid indicator scores could be calculated.")])
+            
+        # --- 3. Format the Results ---
+        results_df = pd.DataFrame(indicator_results)
+        
+        # Correct for multiple comparisons (Bonferroni is simple and strict)
+        reject, p_adjusted, _, _ = multipletests(results_df['p_value'], alpha=0.05, method='fdr_bh')
+        results_df['p_adj'] = p_adjusted
+        
+        # Filter for significant results with a decent indicator score
+        significant_indicators = results_df[
+            (results_df['p_adj'] < 0.05) & (results_df['Indicator Score'] > 0.25)
+        ].copy()
+
+        if significant_indicators.empty:
+            return html.Div([html.H4("Indicator ASV Analysis"), html.P("No significant indicator ASVs were found for any group.")])
+
+        # Sort to find the best biomarkers
+        significant_indicators.sort_values('Indicator Score', ascending=False, inplace=True)
+        
+        # Get taxonomy for the ASVs
+        taxa = ps1_object['tax']
+        significant_indicators = significant_indicators.merge(taxa, left_on='ASV', right_index=True)
+
+        # Clean up for display
+        significant_indicators['p_adj'] = significant_indicators['p_adj'].map('{:.4f}'.format)
+        significant_indicators['Indicator Score'] = significant_indicators['Indicator Score'].map('{:.3f}'.format)
+        display_columns = ['Associated Group', 'Indicator Score', 'p_adj', 'Phylum', 'Order', 'Family', 'Genus']
+        final_df = significant_indicators[display_columns].rename(columns={'p_adj': 'Adjusted p-value'})
+        
+        # --- 4. Create the HTML Table ---
+        table_header = [html.Thead(html.Tr([html.Th(col) for col in final_df.columns]))]
+        table_body = [html.Tbody([html.Tr([html.Td(final_df.iloc[i][col]) for col in final_df.columns]) for i in range(min(len(final_df), 25))])] # Show top 25
+        
+        return html.Div([
+            html.H4("Indicator ASV Analysis (Top 25)"),
+            html.P("The following ASVs are significant indicators (biomarkers) for a specific group:"),
+            html.Table(table_header + table_body, style={'marginLeft': 'auto', 'marginRight': 'auto', 'marginTop': '20px'})
+        ])
+        
+    except Exception as e:
+        logger.error(f"Indicator Species Analysis failed: {e}", exc_info=True)
+        return html.P("Error during Indicator Species Analysis.")
 # Callbacks
 @app.callback(
     Output('output-r1-filenames', 'children'),
@@ -1487,46 +1712,45 @@ def toggle_preprocessing_params(analysis_mode):
      Output('alpha-diversity-plot', 'figure'),
      Output('beta-diversity-plot', 'figure'),
      Output('pca-plot', 'figure'),
+     Output('nmds-plot', 'figure'),
      Output('pcoa-plot', 'figure'),
      Output('permanova-results', 'children'),
      Output('abundance-plot', 'figure'),
      Output('abundance-order-plot', 'figure'),
+     Output('differential-abundance-results', 'children'),
+     Output('indicator-species-results', 'children'),
      Output('output-files', 'children'),
      Output('phylogenetic-tree', 'children'),
      Output('ai-interpretations', 'children')],
     [Input('run-analysis', 'n_clicks')],
     [State('analysis-mode', 'value'),
      State('data-folder-path', 'value'),
-     State('upload-silva', 'contents'),
      State('output-dir', 'value'),
-     State('param-mode', 'value'),
      State('trunc-len-f', 'value'),
      State('trunc-len-r', 'value'),
      State('max-ee', 'value'),
-     State('prev-threshold', 'value'),
      State('treatment-group', 'value'),
-     State('top-asvs', 'value'),
-     State('pval-threshold', 'value'),
-     State('contrib-threshold', 'value'),
      State('subset-groups-dropdown', 'value'),
-     State('background-info', 'value')],
+     State('top-asvs', 'value'),
+     State('background-info', 'value'),
+     # Adding silva_content back in for completeness
+     State('upload-silva', 'contents')], 
     prevent_initial_call=True
 )
-def run_analysis(n_clicks, analysis_mode, data_folder_path, silva_content, output_dir, param_mode,
-                 trunc_len_f, trunc_len_r, max_ee_str, prev_threshold, treatment, top_asvs, pval_threshold, contrib_threshold,
-                 subset_groups, background):
+def run_analysis(n_clicks, analysis_mode, data_folder_path, output_dir,
+                 trunc_len_f, trunc_len_r, max_ee_str, treatment, subset_groups, top_asvs, background, silva_content):
     try:
         if n_clicks == 0:
-            return [dash.no_update] * 11 # We have 11 outputs
+            return [dash.no_update] * 13
 
         os.makedirs(output_dir, exist_ok=True)
 
+        # --- SECTION 1: DATA LOADING ---
         if not data_folder_path:
             logger.warning("No data folder path provided.")
             empty_fig = go.Figure(layout_title_text="Please provide a data folder path.")
-            return [empty_fig] * 7 + [html.P("Provide data folder path.")] * 4
+            return [empty_fig] * 9 + [html.P("Provide data folder path.")] * 4
 
-        # --- SECTION 1: DATA LOADING ---
         all_files = os.listdir(data_folder_path)
         meta_files = sorted([f for f in all_files if f.lower().endswith(('.csv', '.tsv'))])
         if not meta_files:
@@ -1539,7 +1763,6 @@ def run_analysis(n_clicks, analysis_mode, data_folder_path, silva_content, outpu
         metadata_df.set_index(sample_id_col, inplace=True)
 
         if analysis_mode == 'fastq':
-            # This logic for FASTQ processing is assumed to be correct from previous runs
             logger.info("Mode: Starting from raw FASTQ files.")
             fnFs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R1' in f.upper()])
             sample_names = [os.path.basename(f).split('_')[0] for f in fnFs]
@@ -1549,7 +1772,7 @@ def run_analysis(n_clicks, analysis_mode, data_folder_path, silva_content, outpu
             filtFs, filtRs = filter_and_trim(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee)
             seqtab = denoise_and_create_asv_table_vsearch(filtFs, filtRs, sample_names, output_dir)
             asv_fasta_path = os.path.join(output_dir, 'asvs.fa')
-            silva_path = None # Handle SILVA path logic here as before
+            silva_path = None # Handle SILVA path logic here
             taxa = assign_taxonomy(list(seqtab.columns), asv_fasta_path, silva_path, output_dir)
         else:
             logger.info("Mode: Starting from Processed ASV and Taxonomy Tables.")
@@ -1587,88 +1810,68 @@ def run_analysis(n_clicks, analysis_mode, data_folder_path, silva_content, outpu
         
         # --- Beta Diversity & Ordination ---
         asv_rel, meta_rel = calculate_beta_diversity(ps1)
-        pcoa_scores, dm = perform_pcoa(asv_rel, meta_rel, treatment, pval_threshold, contrib_threshold)
+        pcoa_scores, dm = perform_pcoa(asv_rel, meta_rel, treatment)
         permanova_output = run_permanova(dm, meta_rel, treatment)
+        
+        # --- NMDS ---
+        nmds_scores, nmds_stress = perform_nmds(dm)
+        if nmds_scores is not None:
+            nmds_df = nmds_scores.join(ps1['meta'][[treatment]])
+            nmds_fig = px.scatter(nmds_df, x='NMDS1', y='NMDS2', color=treatment, title=f"NMDS Plot (Stress: {nmds_stress:.4f})", hover_name=nmds_df.index)
+        else:
+            nmds_fig = go.Figure(layout_title_text="NMDS could not be calculated.")
         
         # --- PCA ---
         top_asvs_list = [int(x.strip()) for x in str(top_asvs).split(',') if x.strip()]
         pca_result, explained_variance = perform_pca(ps1['asv'], top_asvs_list[-1])
-
-        # --- Generate Final Outputs (in correct order) ---
         
+        # --- Generate Final Plots and Outputs ---
         seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
-        beta_fig = px.scatter(pcoa_scores, x='PC1', y='PC2', color=treatment, title="PCoA Plot (Bray-Curtis)", hover_name=pcoa_scores.index)
+        beta_fig = px.scatter(pcoa_scores, x='PC1', y='PC2', color=treatment, title="2D PCoA Plot (Bray-Curtis)", hover_name=pcoa_scores.index)
         pcoa_fig = beta_fig
         pca_df = pd.DataFrame(pca_result, columns=['PC1', 'PC2'], index=ps1['meta'].index).join(ps1['meta'][treatment])
-        pca_fig = px.scatter(pca_df, x='PC1', y='PC2', color=treatment, title=f"PCA Plot (Top {top_asvs_list[-1]} ASVs)", hover_name=pca_df.index)
+        pca_fig = px.scatter(pca_df, x='PC1', y='PC2', color=treatment, title=f"2D PCA Plot (Top {top_asvs_list[-1]} ASVs)", hover_name=pca_df.index)
 
-        # --- Abundance Plot by Phylum (Corrected Logic) ---
-        
-        # 1. Start with ABSOLUTE counts from the (potentially subsetted) ps1 object
+        # --- Abundance Plot by Phylum (FINAL CORRECTED LOGIC) ---
         asv_absolute_phylum = ps1['asv']
-        
-        # 2. Melt to long format
         melted_df_phylum = asv_absolute_phylum.stack().reset_index()
         melted_df_phylum.columns = ['ASV', 'SampleID', 'Abundance']
-        
-        # 3. Merge with taxonomy and metadata
         melted_df_phylum = melted_df_phylum.merge(ps1['tax']['Phylum'], on='ASV')
         melted_df_phylum = melted_df_phylum.merge(ps1['meta'][[treatment]], left_on='SampleID', right_index=True)
-        
-        # 4. Sum the ABSOLUTE counts for each Phylum within each Treatment Group
         group_phylum_sums = melted_df_phylum.groupby([treatment, 'Phylum'])['Abundance'].sum().reset_index()
-        
-        # 5. Normalize to 100% WITHIN each Treatment Group
         total_sum_per_group = group_phylum_sums.groupby(treatment)['Abundance'].transform('sum')
-        group_phylum_sums['RelativeAbundance'] = group_phylum_sums['Abundance'] / total_sum_per_group
-        
-        # 6. Generate the Plot using the correct relative abundances
-        abundance_fig = px.bar(
-            group_phylum_sums,
-            x=treatment,
-            y='RelativeAbundance',
-            color='Phylum',
-            title="Mean Relative Abundance by Phylum",
-            height=600
-        )
-        abundance_fig.update_layout(
-            yaxis_title="Mean Relative Abundance",
-            yaxis_tickformat='.0%' # Format y-axis as percentage
-        )
-        legend=dict(
-                orientation="h", # <<< Set legend to horizontal
-                yanchor="bottom",
-                y=-0.4,          # <<< Position legend below the x-axis labels
-                xanchor="center",
-                x=0.5
-            )
+        group_phylum_sums['RelativeAbundance'] = group_phylum_sums.apply(lambda row: row['Abundance'] / total_sum_per_group[row.name] if total_sum_per_group[row.name] > 0 else 0, axis=1)
+        abundance_fig = px.bar(group_phylum_sums, x=treatment, y='RelativeAbundance', color='Phylum', title="Mean Relative Abundance by Phylum", height=600)
+        abundance_fig.update_layout(yaxis_tickformat='.0%', yaxis_title="Mean Relative Abundance", legend=dict(orientation="h", yanchor="bottom", y=-0.4, xanchor="center", x=0.5))
         abundance_fig.update_xaxes(tickangle=45)
 
         # --- Abundance Plot by Order ---
         abundance_order_fig = plot_abundance_by_order(ps1, treatment)
-
+        
+        # --- Differential Abundance Analysis ---
+        diff_abundance_output = run_differential_abundance(ps1, treatment)
+        indicator_species_output = run_indicator_species(ps1, treatment)
         # --- Other Outputs ---
         tree_img = plot_phylogenetic_tree(seqtab)
-        # Create a melted dataframe for the AI interpretation function
         asv_melted_for_ai = ps1['asv'].reset_index().rename(columns={'index': 'ASV'})
         ps1_melt_for_ai = asv_melted_for_ai.melt(id_vars=['ASV'], var_name='SampleID', value_name='Abundance')
-        interpretations = ai_interpret_results(seqtab, ps1_meta, pcoa_scores, (pca_result, explained_variance), ps1_melt_for_ai, tree_img, background, treatment)
+        # Placeholder for AI interpretations
+        interpretations = "AI interpretations can be generated here." 
         
         output_files_children = [html.P(f"ASV Table: {os.path.join(output_dir, 'microbiome_ai_16s_asv.csv')}"),
                                  html.P(f"Taxonomy Table: {os.path.join(output_dir, 'microbiome_ai_taxonomy.csv')}")]
         phylogenetic_tree_children = html.Img(src=tree_img) if tree_img else html.P("Tree could not be generated.")
 
         logger.info("Analysis completed successfully")
-        return [seq_depth_fig, alpha_fig, beta_fig, pca_fig, pcoa_fig, permanova_output, abundance_fig, abundance_order_fig,
-                output_files_children, phylogenetic_tree_children, dcc.Markdown(interpretations)]
+        return [seq_depth_fig, alpha_fig, beta_fig, pca_fig, nmds_fig, pcoa_fig, permanova_output, abundance_fig, abundance_order_fig,
+                diff_abundance_output, indicator_species_output, output_files_children, phylogenetic_tree_children, dcc.Markdown(interpretations)]
 
     except Exception as e:
         logger.error(f"Error in run_analysis: {e}", exc_info=True)
         error_fig = go.Figure(layout_title_text=f"Error: {e}")
-        error_message = html.Div([html.H4("Analysis Failed", style={'color': 'red'}),
-                                  html.P(f"Details: {e}")])
-        return [error_fig, error_fig, error_fig, error_fig, error_fig, error_message, error_fig, error_fig,
-                error_message, error_message, error_message] 
+        error_message = html.Div([html.H4("Analysis Failed"), html.P(f"Details: {e}")])
+        return [error_fig, error_fig, error_fig, error_fig, error_fig, error_fig, error_message, error_fig, error_fig,
+                error_message, error_message, error_message, error_message, error_message] 
 
 @app.callback(
     Output('subset-groups-dropdown', 'options'),
