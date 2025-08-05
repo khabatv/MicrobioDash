@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Aug  5 13:33:58 2025
+
+@author: schwert
+"""
+
 import dash
 from dash import dcc, html, Input, Output, State
 import plotly.express as px
@@ -44,6 +51,9 @@ from Bio import Phylo
 from scipy.stats import mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 from itertools import combinations
+import multiprocessing
+from filter_and_trim_function import filter_and_trim_parallel
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -502,101 +512,101 @@ def unzip_files(uploaded_files, output_dir):
     except Exception as e:
         logger.error(f"Error unzipping files: {e}")
 
-def run_cutadapt_on_sample(args):
-    """
-    Worker function that runs Cutadapt on a single sample pair.
-    This version uses the full path to the cutadapt executable.
-    """
-    # --- THIS IS THE NEW LINE YOU ARE ADDING ---
-    # Provide the full path to the cutadapt executable you installed with pip.
-    # It should be in the 'Scripts' folder of your conda environment.
-    cutadapt_executable = r"C:\Users\denisova\AppData\Local\anaconda3\envs\microbiome_env\Scripts\cutadapt.exe"
-    
-    # 1. Unpack all the arguments
-    fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, quality_cutoff = args
-    
-    # 2. Define the output file paths
-    filtF = os.path.join(output_dir, f"{sample_name}_F_filt.fastq.gz")
-    filtR = os.path.join(output_dir, f"{sample_name}_R_filt.fastq.gz")
+def _filter_and_trim_worker(args):
 
-    logger.info(f"--- [PID:{os.getpid()}] Starting Cutadapt for sample: '{sample_name}' ---")
+    fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, max_ee = args
+    filt_path = os.path.join(output_dir, "filtered_sequences")
+    filtF = os.path.join(filt_path, f"{sample_name}_F_filt.fastq.gz")
+    filtR = os.path.join(filt_path, f"{sample_name}_R_filt.fastq.gz")
 
-    # 3. Construct the Cutadapt commands using the full path variable
-    command = [
-        cutadapt_executable, # <-- Use the full path
-        '-q', f"{quality_cutoff},{quality_cutoff}",
-        '--minimum-length', '25',
-        '-o', 'temp_F.fastq',
-        '-p', 'temp_R.fastq',
-        '--length', str(trunc_len_f),
-        fnF,
-        fnR
-    ]
+    logger.info(f"--- Processing sample '{sample_name}' from files: {os.path.basename(fnF)} & {os.path.basename(fnR)} ---")
 
-    command2 = [
-        cutadapt_executable, # <-- Use the full path
-        '-o', filtR,
-        '-p', filtF,
-        '--length', str(trunc_len_r),
-        'temp_R.fastq',
-        'temp_F.fastq'
-    ]
-
-    # --- This is the rest of the function you already have ---
-    original_cwd = os.getcwd()
     try:
-        # We run in the output directory to handle the temp files cleanly
-        os.chdir(output_dir)
-        
-        step1_result = subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
-        step2_result = subprocess.run(command2, check=True, capture_output=True, text=True, encoding='utf-8')
+        # Open input files (handles .gz or plain text)
+        open_f = gzip.open if fnF.lower().endswith('.gz') else open
+        open_r = gzip.open if fnR.lower().endswith('.gz') else open
 
-        # Clean up temporary files
-        os.remove('temp_F.fastq')
-        os.remove('temp_R.fastq')
-        
-        # IMPORTANT: Change back to the original directory
-        os.chdir(original_cwd)
-        
-        # Return the full paths to the output files
-        return (os.path.join(output_dir, filtF), os.path.join(output_dir, filtR))
+        with open_f(fnF, 'rt') as f_in, open_r(fnR, 'rt') as r_in:
+            records_f_iter = SeqIO.parse(f_in, 'fastq')
+            records_r_iter = SeqIO.parse(r_in, 'fastq')
+
+            kept_records_f = []
+            kept_records_r = []
+            initial_count = 0
+
+            for rec_f, rec_r in zip(records_f_iter, records_r_iter):
+                initial_count += 1
+                if (len(rec_f) >= trunc_len_f and
+                    len(rec_r) >= trunc_len_r and
+                    np.mean(rec_f.letter_annotations['phred_quality']) >= 30 and
+                    np.mean(rec_r.letter_annotations['phred_quality']) >= 30):
+
+                    kept_records_f.append(rec_f[:trunc_len_f])
+                    kept_records_r.append(rec_r[:trunc_len_r])
+
+        final_count = len(kept_records_f)
+        if initial_count > 0:
+            logger.info(f"[{sample_name}] Initial read pairs: {initial_count}")
+            logger.info(f"[{sample_name}] Read pairs remaining after filtering: {final_count} ({final_count/initial_count:.2%})")
+        else:
+            logger.warning(f"[{sample_name}] No read pairs found in the input files.")
+            return None, None
+
+
+        if not kept_records_f:
+            logger.error(f"[{sample_name}] Zero read pairs remaining after filtering. Check truncation lengths and data quality.")
+            return None, None
+
+        with gzip.open(filtF, 'wt') as f_out:
+            SeqIO.write(kept_records_f, f_out, 'fastq')
+        with gzip.open(filtR, 'wt') as r_out:
+            SeqIO.write(kept_records_r, r_out, 'fastq')
+
+        return filtF, filtR
 
     except Exception as e:
-        # Ensure we change back directory even if there's an error
-        os.chdir(original_cwd)
-        logger.error(f"An error occurred while processing '{sample_name}': {e}")
-        if isinstance(e, subprocess.CalledProcessError):
-            logger.error(f"Cutadapt Error Output:\n{e.stderr.strip()}")
-        return (None, None)
-
-
-def filter_and_trim_parallel(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, quality_cutoff=20):
-    filt_path = os.path.join(output_dir, "filtered_sequences")
-    os.makedirs(filt_path, exist_ok=True)
-
-    # Prepare the list of arguments for each job
-    args_list = [
-        (fnF, fnR, name, filt_path, trunc_len_f, trunc_len_r, quality_cutoff)
-        for fnF, fnR, name in zip(fnFs, fnRs, sample_names)
-    ]
-
-    # Run jobs sequentially (this is not parallel, but will prove the worker function is correct)
-    logger.info("Starting sequential processing to debug...")
-    results = []
-    for args in args_list:
-        result = run_cutadapt_on_sample(args)
-        results.append(result)
-
-    # Process the results
-    filtFs_out = [res[0] for res in results if res and res[0]]
-    filtRs_out = [res[1] for res in results if res and res[1]]
-
-    if len(filtFs_out) != len(fnFs):
-        logger.error("One or more samples failed during processing. Check logs.")
+        logger.error(f"Error processing sample {sample_name}: {e}", exc_info=True)
         return None, None
 
-    logger.info("Sequential processing completed successfully.")
-    return filtFs_out, filtRs_out
+def filter_and_trim(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee):
+    """
+    Filter and trim FASTQ sequences in parallel using a multiprocessing Pool.
+    """
+    try:
+        filt_path = os.path.join(output_dir, "filtered_sequences")
+        if not os.path.exists(filt_path):
+            os.makedirs(filt_path)
+
+        if not fnFs or not fnRs:
+            logger.error("filter_and_trim was called with empty file lists (fnFs or fnRs).")
+            return None, None
+
+        # Prepare arguments for each worker process
+        args_list = [
+            (fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, max_ee)
+            for fnF, fnR, sample_name in zip(fnFs, fnRs, sample_names)
+        ]
+
+        # Use a multiprocessing Pool to process files in parallel
+        # We wrap this in a `if __name__ == '__main__':` block in the main script
+        # to ensure it works correctly on all platforms (especially Windows).
+        with multiprocessing.Pool() as pool:
+            results = pool.map(_filter_and_trim_worker, args_list)
+
+        # Process the results to separate the filtered file paths
+        filtFs = [res[0] for res in results if res and res[0]]
+        filtRs = [res[1] for res in results if res and res[1]]
+
+        if not filtFs or not filtRs or len(filtFs) != len(filtRs):
+            logger.error("Parallel filtering and trimming failed to produce valid output for some samples. Aborting.")
+            return None, None
+
+        logger.info(f"Successfully filtered and trimmed all sequences in parallel to: {filt_path}")
+        return filtFs, filtRs
+
+    except Exception as e:
+        logger.error(f"Error in parallel filtering and trimming orchestrator: {e}", exc_info=True)
+        return None, None
 
 from collections import defaultdict
 
@@ -610,7 +620,7 @@ def denoise_and_create_asv_table_vsearch(filtFs, filtRs, sample_names, output_di
     Denoises sequences and creates an ASV table using vsearch.
     This version corrects the order of operations and includes robust checks and safe cleanup.
     """
-    vsearch_executable = r"C:\Users\denisova\Desktop\Renamed files\vsearch\vsearch-2.30.0-win-x86_64\bin\vsearch.exe"
+    vsearch_executable = r"C:\Users\schwert\.conda\envs\Environment_Python_Microbiome_Project\vsearch-2.30.0-win-x86_64\bin\vsearch.exe"
     
     if not os.path.exists(vsearch_executable):
         raise FileNotFoundError(f"vsearch not found at: {vsearch_executable}")
@@ -749,7 +759,7 @@ def assign_taxonomy(asv_sequences, asv_fasta_path, silva_path, output_dir):
         return tax_df
 
     # --- START: New High-Performance Logic ---
-    vsearch_executable = r"C:\Users\denisova\Desktop\Renamed files\vsearch\vsearch-2.30.0-win-x86_64\bin\vsearch.exe"
+    vsearch_executable = r"C:\Users\schwert\.conda\envs\Environment_Python_Microbiome_Project\vsearch-2.30.0-win-x86_64\bin\vsearch.exe"
     if not os.path.exists(vsearch_executable):
         raise FileNotFoundError(f"vsearch not found at: {vsearch_executable}. Please update the path.")
 
@@ -2025,8 +2035,3 @@ Created on Thu Jul 17 12:39:30 2025
 
 @author: denisova
 """
-
-
-
-
-
