@@ -1,0 +1,38 @@
+import os
+import subprocess
+from Bio import Align, SeqIO
+
+# This logger will be configured by the main app
+import logging
+logger = logging.getLogger(__name__)
+
+def merge_worker(args):
+    """Helper function to merge one sample's reads with vsearch."""
+    fF, fR, s_name, vsearch_executable, output_dir = args
+    temp_merged_fq = os.path.join(output_dir, f"{s_name}_merged.fq")
+    merge_cmd = [
+        vsearch_executable, '--fastq_mergepairs', fF, '--reverse', fR,
+        '--fastqout', temp_merged_fq, '--relabel', f"{s_name};"
+    ]
+    try:
+        # Use capture_output=True to prevent vsearch from printing to the console directly
+        result = subprocess.run(merge_cmd, check=True, capture_output=True, text=True)
+        return temp_merged_fq
+    except subprocess.CalledProcessError as e:
+        logger.error(f"vsearch merge failed for sample {s_name}. Stderr: {e.stderr}")
+        return None
+
+def calculate_distance_pair_worker(args):
+    """Calculates the distance between a single pair of sequences."""
+    i, j, seqs, aligner_mode = args
+    
+    # Re-initialize the aligner in each worker
+    aligner = Align.PairwiseAligner()
+    aligner.mode = aligner_mode
+
+    seq1 = seqs[i].seq
+    seq2 = seqs[j].seq
+    score = aligner.align(seq1, seq2).score
+    max_len = max(len(seq1), len(seq2))
+    distance = 1 - (score / max_len) if max_len > 0 else 1
+    return i, j, distance
