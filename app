@@ -5,6 +5,10 @@ import plotly.graph_objects as go
 from skbio.diversity import alpha_diversity, beta_diversity
 from skbio.stats.ordination import pcoa
 from skbio import DistanceMatrix
+from skbio.stats.distance import permanova
+from sklearn.manifold import MDS
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 import pandas as pd
 import numpy as np
 import os
@@ -32,10 +36,20 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 import logging
-
-# Set up logging
+import io
+import re
+from Bio import Phylo
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+import multiprocessing
+from filter_and_trim_function import filter_and_trim_parallel
+from vsearch_multithread import merge_worker, calculate_distance_pair_worker
+from itertools import combinations# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+CPU_CORES = max(1, os.cpu_count() - 1)
 
 # Configure Gemini API (optional for sample data)
 GEMINI_API_KEY = "AIzaSyDiuCPQ8vYm9XLxB4yTSh4H1fBXxVcRUhY"
@@ -62,36 +76,29 @@ Sample3,Stress2
 """
 sample_seqtab = pd.DataFrame(
     [
-        [100, 50, 20, 10],  # Sample1
-        [30, 80, 40, 5],   # Sample2
-        [10, 20, 60, 70]   # Sample3
+        [100, 50, 20, 10],
+        [30, 80, 40, 5],
+        [10, 20, 60, 70]
     ],
     index=['Sample1', 'Sample2', 'Sample3'],
-    columns=['ASV1', 'ASV2', 'ASV3', 'ASV4']
+    columns=[
+        'TACGTAGGTGGCAAGCGTTGTCCGGAATTATTGGGCGTAAAGCGCGCGCAGGCGGTTTCTTAAGTCTGATGTGAAAGCCCCCGGCTCAACCGGGGAGGGTCATTGGAAACTGGGGAACTTGAGTGCAGAAGAGGAAAGTGGAATTCCATGTGTAGCGGTGAAATGCGTAGATATATGGAGGAACACCAGTGGCGAAGGCGACTTTCTGGTCTGTAACTGAC',
+        'TACGTAGGTGGCGAGCGTTGTCCGGAATTATTGGGCGTAAAGCGCGCGCAGGCGGTTTTTTAAGTCTGATGTGAAAGCCCCCGGCTCAACCGGGGAGGGTCATTGGAAACTGGAAAACTTGAGTGCAGAAGAGGAGAGTGGAATTCCATGTGTAGCGGTGAAATGCGTAGATATATGGAGGAACACCAGTGGCGAAGGCGACTCTCTGGTCTGTAACTGAC',
+        'TACGTAGGGGGCAAGCGTTGTCCGGATTTACTGGGCGTAAAGCGCGTGCAGGCGGTTATTCAAGTCGGATGTGAAATCCCCGGGCTCAACCTGGGAACTGCATTCGAAACTGGTGAGCTAGAGTTTGGTAGAGGGTGGTGGAATTTCCTGTGTAGCGGTGAAATGCGTAGATATAGGAAGGAACACCAGTGGCGAAGGCGACCACCTGGACTGATACTGAC',
+        'TACGTAGGTGGCAAGCGTTATCCGGAATTATTGGGCGTAAAGCGCGCGTAGGCGGTTTTGTAAGTCTGAAGTGAAATCCCTGGGCTCAACCTGGGAACTGCATTCAGAACTGGGCGACTAGAGTACGTCAGAGGGGAGTGGAATTCCTGGTGTAGCGGTGAAATGCATAGATATCAGGAGGAACACCGGTGGCGAAGGCGGCTCACTGGACGTATTACTGAC'
+    ]
 )
 sample_taxa = pd.DataFrame(
     [
-        ['Bacteria', 'Proteobacteria', 'Gammaproteobacteria', 'Enterobacteriales', 'Enterobacteriaceae', 'Escherichia'],
-        ['Bacteria', 'Firmicutes', 'Bacilli', 'Lactobacillales', 'Lactobacillaceae', 'Lactobacillus'],
-        ['Bacteria', 'Actinobacteria', 'Actinomycetia', 'Streptomycetales', 'Streptomycetaceae', 'Streptomyces'],
-        ['Bacteria', 'Bacteroidetes', 'Bacteroidia', 'Bacteroidales', 'Bacteroidaceae', 'Bacteroides']
+        ['Bacteria', 'Proteobacteria', 'Gammaproteobacteria', 'Enterobacteriales', 'Enterobacteriaceae', 'Escherichia', np.nan],
+        ['Bacteria', 'Firmicutes', 'Bacilli', 'Lactobacillales', 'Lactobacillaceae', 'Lactobacillus', np.nan],
+        ['Bacteria', 'Actinobacteria', 'Actinomycetia', 'Streptomycetales', 'Streptomycetaceae', 'Streptomyces', np.nan],
+        ['Bacteria', 'Bacteroidetes', 'Bacteroidia', 'Bacteroidales', 'Bacteroidaceae', 'Bacteroides', np.nan]
     ],
-    index=['ASV1', 'ASV2', 'ASV3', 'ASV4'],
-    columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus']
+    index=sample_seqtab.columns, # Use the new DNA sequences as the index
+    columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus','Species']
 )
-sample_background = "Organism: Simulated algae microbiome, Experiment: Effect of stress conditions on microbial diversity."
-
-# Simulated FASTQ data (minimal for demo)
-sample_fastq_r1 = [
-    "@Sample1_1\nACGTACGTACGT\n+\nIIIIIIIIIIII\n@Sample1_2\nTGCATGCA\n+\nIIIIIIII\n",
-    "@Sample2_1\nCGTACGTACGTA\n+\nIIIIIIIIIIII\n@Sample2_2\nATGCATGC\n+\nIIIIIIII\n",
-    "@Sample3_1\nGTACGTACGTAC\n+\nIIIIIIIIIIII\n@Sample3_2\nCATGCATG\n+\nIIIIIIII\n"
-]
-sample_fastq_r2 = [
-    "@Sample1_1\nTACGTACGTACG\n+\nIIIIIIIIIIII\n@Sample1_2\nATGCATGC\n+\nIIIIIIII\n",
-    "@Sample2_1\nACGTACGTACGT\n+\nIIIIIIIIIIII\n@Sample2_2\nTGCATGCA\n+\nIIIIIIII\n",
-    "@Sample3_1\nCGTACGTACGTA\n+\nIIIIIIIIIIII\n@Sample3_2\nGCATGCAT\n+\nIIIIIIII\n"
-]
+sample_taxa.index.name = 'ASV'
 sample_filenames = ['Sample1_R1.fastq', 'Sample2_R1.fastq', 'Sample3_R1.fastq', 'Sample1_R2.fastq', 'Sample2_R2.fastq', 'Sample3_R2.fastq']
 
 # Initialize Dash app
@@ -103,19 +110,28 @@ app.layout = html.Div([
     
     # Input Section
     html.H3("Input Parameters"),
-    html.Button('Load Sample Data', id='load-sample-data', n_clicks=0),
+    html.Button('Use Internal Sample Data', id='load-sample-data', n_clicks=0,
+                title="Loads small, pre-packaged sample data to test the analysis pipeline."),
     html.Br(), html.Br(),
-    html.Label("Upload FASTQ Forward Reads (R1):"),
-    dcc.Upload(id='upload-fastq-r1', children=html.Button('Upload R1 Files'), multiple=True),
-    html.Label("Upload FASTQ Reverse Reads (R2):"),
-    dcc.Upload(id='upload-fastq-r2', children=html.Button('Upload R2 Files'), multiple=True),
-    html.Label("Upload Metadata CSV:"),
-    dcc.Upload(id='upload-metadata', children=html.Button('Upload Metadata')),
-    html.Label("Upload SILVA Taxonomy Database:"),
-    dcc.Upload(id='upload-silva', children=html.Button('Upload SILVA Database')),
+
+    # New input for the data folder path
+    html.Label("Project Data Folder Path (contains your FASTQ and metadata files):"),
+    dcc.Input(id='data-folder-path', value='./uploads', type='text', style={'width': '80%'}),
+    html.Button('List Files in Folder', id='list-files-button', n_clicks=0, style={'marginLeft': '10px'}),
+    html.P("Place your data in a folder (e.g., 'uploads') and provide the path here.", style={'fontSize': 'small', 'color': 'gray'}),
+
+    html.Div(id='output-r1-filenames', style={'marginTop': '10px'}),
+    html.Div(id='output-r2-filenames', style={'marginTop': '10px'}),
+    html.Div(id='output-metadata-filename', style={'marginTop': '10px'}),
+
+    html.Label("Upload SILVA Taxonomy Database (or place in data folder and name it silva.fasta)"),
+    dcc.Upload(id='upload-silva', children=html.Button('Upload SILVA File')),
+    html.Div(id='silva-status-output', style={'marginTop': '5px', 'padding': '5px', 'borderRadius': '3px'}),
+    
     html.Label("Output Directory:"),
     dcc.Input(id='output-dir', value='./output', type='text'),
-    html.Label("Background Information (e.g., organism, experiment design, special analysis needs):"),
+    
+    html.Label("Background Information:"),
     dcc.Textarea(id='background-info', value='', style={'width': '100%', 'height': 100}),
     
     # AI Clarification Questions
@@ -133,30 +149,55 @@ app.layout = html.Div([
         value='manual',
         clearable=False
     ),
-    
+    html.H3("Analysis Starting Point"),
+dcc.RadioItems(
+    id='analysis-mode',
+    options=[
+        {'label': 'Start from raw FASTQ files (Slow, run first)', 'value': 'fastq'},
+        {'label': 'Start from Processed ASV/Taxonomy Tables (Fast)', 'value': 'asv'}
+    ],
+    value='fastq', # Default to starting from scratch
+    labelStyle={'display': 'block'}
+),
+html.Br(),
     # Parameter Tuning
-    html.Div(id='manual-params', children=[
-        html.H3("Analysis Parameters"),
+   html.Div(id='manual-params', children=[
+    html.H3("Analysis Parameters"),
+
+    # This is the new wrapper div we are adding
+    html.Div(id='preprocessing-params-div', children=[
+        html.H4("Pre-processing Parameters (for FASTQ mode)", style={'color': '#555'}),
         html.Label("Truncation Length Forward (e.g., 280):"),
         dcc.Input(id='trunc-len-f', value=280, type='number'),
         html.Label("Truncation Length Reverse (e.g., 220):"),
         dcc.Input(id='trunc-len-r', value=220, type='number'),
         html.Label("Max Expected Errors (Forward, Reverse):"),
         dcc.Input(id='max-ee', value='2,2', type='text'),
-        html.Label("Detection Threshold for Prevalence Filtering:"),
-        dcc.Input(id='prev-threshold', value=0, type='number'),
-        html.Label("Treatment Group Column:"),
-        dcc.Input(id='treatment-group', value='Treatment', type='text'),
-        html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
-        dcc.Input(id='top-asvs', value='20,50,100', type='text'),
-        html.Label("P-Value Threshold for PCoA Vectors:"),
-        dcc.Input(id='pval-threshold', value=0.005, type='number'),
-        html.Label("Contribution Threshold for PCoA Vectors:"),
-        dcc.Input(id='contrib-threshold', value=0.65, type='number'),
     ]),
-    
+    html.H4("Downstream Analysis Parameters", style={'color': '#555'}), # Header for clarity
+    html.Label("Detection Threshold for Prevalence Filtering:"),
+    dcc.Input(id='prev-threshold', value=0, type='number'),
+    html.Label("Treatment Group Column:"),
+    dcc.Input(id='treatment-group', value='Treatment', type='text'),
+    html.Label("Select Groups to Compare (subsetting):"),
+dcc.Dropdown(
+    id='subset-groups-dropdown', 
+    placeholder="Select groups to include (leave blank for all)...",
+    multi=True # This property allows selecting multiple options
+),
+
+# The next line should be "Top ASVs for PCA"
+html.Label("Top ASVs for PCA (e.g., 20,50,100):"),
+    dcc.Input(id='top-asvs', value='20,50,100', type='text'),
+    html.Label("P-Value Threshold for PCoA Vectors:"),
+    dcc.Input(id='pval-threshold', value=0.005, type='number'),
+    html.Label("Contribution Threshold for PCoA Vectors:"),
+    dcc.Input(id='contrib-threshold', value=0.65, type='number'),
+]),
     html.Div(id='ai-suggested-params', style={'display': 'none'}, children=[
         html.H3("AI-Suggested Parameters"),
+        html.Button('Suggest AI Parameters', id='suggest-ai-params-button', n_clicks=0),
+        html.Br(),
         html.Label("Select AI-Suggested Truncation Length Forward:"),
         dcc.Dropdown(id='ai-trunc-len-f', options=[], value=None),
         html.Label("Select AI-Suggested Truncation Length Reverse:"),
@@ -185,7 +226,12 @@ app.layout = html.Div([
     dcc.Graph(id='beta-diversity-plot'),
     dcc.Graph(id='pca-plot'),
     dcc.Graph(id='pcoa-plot'),
+    dcc.Graph(id='nmds-plot'),
+    html.Div(id='permanova-results', style={'textAlign': 'center'}),
     dcc.Graph(id='abundance-plot'),
+    dcc.Graph(id='abundance-order-plot'),
+    html.Div(id='differential-abundance-results'),
+    html.Div(id='indicator-species-results'),
     html.Div(id='output-files'),
     html.Div(id='phylogenetic-tree'),
     html.Div(id='ai-interpretations'),
@@ -242,7 +288,6 @@ def ai_analyze_background(background):
 def ai_analyze_quality_profiles(fnFs, fnRs):
     if not ai_available:
         return None
-    # For sample data, return hardcoded values
     if fnFs[0].startswith('data:'):
         return {'trunc_len_f': 12, 'trunc_len_r': 12, 'max_ee': [2, 2]}
     quality_summary = []
@@ -277,7 +322,6 @@ def ai_analyze_quality_profiles(fnFs, fnRs):
 def ai_analyze_prevalence(seqtab):
     if not ai_available:
         return 0
-    # For sample data, return hardcoded value
     if seqtab.index[0] == 'Sample1':
         return 5
     prev = seqtab.sum(axis=0)
@@ -299,7 +343,6 @@ def ai_analyze_prevalence(seqtab):
 def ai_analyze_metadata(metadata):
     if not ai_available:
         return None
-    # For sample data, return 'Treatment'
     if 'Treatment' in metadata.columns:
         return 'Treatment'
     columns = metadata.columns.tolist()
@@ -320,7 +363,6 @@ def ai_analyze_metadata(metadata):
 def ai_analyze_pca_pcoa(asv, ordination_scores):
     if not ai_available:
         return None
-    # For sample data, return hardcoded values
     if asv.index[0] == 'ASV1':
         return {'top_asvs': '20,50,100', 'pval_threshold': 0.005, 'contrib_threshold': 0.65}
     asv_sums = asv.sum()
@@ -340,33 +382,39 @@ def ai_analyze_pca_pcoa(asv, ordination_scores):
         return None
     return None
 
-def ai_interpret_results(seqtab, ps1_meta, pcoa_scores, pca_result, ps1_melt, tree_img, background):
+def ai_interpret_results(seqtab, ps1_meta, pcoa_scores, pca_result, ps1_melt, tree_img, background, treatment_column_name):
+    """
+    This function now correctly calculates top phyla for the AI prompt.
+    """
     if not ai_available:
         return "AI interpretation unavailable."
-    # For sample data, return a simplified interpretation
-    if seqtab.index[0] == 'Sample1':
-        return """
-        # Sample Data Interpretation
-        - **Sequencing Depth**: Mean depth is ~180 reads/sample, sufficient for small-scale analysis.
-        - **Alpha Diversity**: Shannon diversity shows moderate diversity, with Stress2 having higher diversity.
-        - **Beta Diversity**: PCoA separates samples by Treatment, indicating distinct microbial communities.
-        - **PCA**: Top ASVs explain ~60% variance, suggesting key taxa drive differences.
-        - **Abundance**: Proteobacteria dominate in Control, while Bacteroidetes increase in Stress2.
-        - **Phylogenetic Tree**: ASVs cluster by phylum, consistent with taxonomy.
-        *Reference*: Similar patterns seen in marine microbiomes (Smith et al., 2020, PubMed ID: 12345678).
-        """
+
+    # This part is fine
+    if 'PC1' in pcoa_scores.columns and 'PC2' in pcoa_scores.columns:
+        pcoa_variance_explained = pcoa_scores[['PC1', 'PC2']].var().values
+    else:
+        numeric_pcoa_scores = pcoa_scores.select_dtypes(include=np.number)
+        pcoa_variance_explained = numeric_pcoa_scores.var().values[:2]
+
+    # --- THIS IS THE CRITICAL FIX ---
+    # Merge the melted data with the taxonomy to get the 'Phylum' column
+    ps1_melt_with_taxa = ps1_melt.merge(global_data['ps1']['tax']['Phylum'], on='ASV')
+    # Now, group by 'Phylum' instead of 'ASV'
+    top_phyla_list = ps1_melt_with_taxa.groupby('Phylum')['Abundance'].sum().nlargest(5).index.tolist()
+    
+    # Construct the prompt with the CORRECT information
     prompt = f"""
     Interpret the following microbiome analysis results for a study with background: {background}
     - Sequencing Depth: Mean={seqtab.sum(axis=1).mean()}, Median={seqtab.sum(axis=1).median()}
-    - Alpha Diversity (Shannon): Mean={ps1_meta['Shannon'].mean()}, Groups={ps1_meta['Treatment'].nunique()}
-    - Beta Diversity (PCoA): Variance explained={pcoa_scores.var().values[:2]}
+    - Alpha Diversity (Shannon): Mean={ps1_meta['Shannon'].mean()}, Groups={ps1_meta[treatment_column_name].nunique()}
+    - Beta Diversity (PCoA): Variance explained={pcoa_variance_explained}
     - PCA: Variance explained={pca_result[1][:2]}
-    - Abundance: Top phyla={ps1_melt.groupby('ASV')['Abundance'].sum().nlargest(5).index.tolist()}
+    - Abundance: Top phyla={top_phyla_list}
     - Phylogenetic Tree: Generated successfully.
-    Provide a detailed interpretation of each analysis, including visualizations and tables, comparing results to typical microbiome studies (e.g., soil, marine, gut microbiomes). Include citations to relevant literature (e.g., from PubMed or Google Scholar). Format as markdown.
+    Provide a detailed interpretation... (rest of prompt is the same)
     """
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(prompt, request_options={'timeout': 120})
         if response and hasattr(response, 'text'):
             return response.text
     except Exception as e:
@@ -397,7 +445,7 @@ def generate_pdf_report(seqtab, ps1_meta, pcoa_scores, pca_result, ps1_melt, tre
         elements.append(Image(img_buffer, width=350, height=250))
         
         elements.append(Paragraph("Beta Diversity (PCoA)", styles['Heading2']))
-        fig = px.scatter(pcoa_scores, x=0, y=1, color='Treatment', title='PCoA Plot')
+        fig = px.scatter(pcoa_scores, x='PC1', y='PC2', color='Treatment', title='PCoA Plot')
         img_buffer = BytesIO()
         fig.write_image(img_buffer, format='png')
         elements.append(Image(img_buffer, width=350, height=250))
@@ -433,7 +481,6 @@ def generate_pdf_report(seqtab, ps1_meta, pcoa_scores, pca_result, ps1_melt, tre
         logger.error(f"Error generating PDF report: {e}")
         return None
 
-# Helper functions
 def unzip_files(uploaded_files, output_dir):
     """
     Unzip uploaded files to the specified output directory.
@@ -458,86 +505,309 @@ def unzip_files(uploaded_files, output_dir):
     except Exception as e:
         logger.error(f"Error unzipping files: {e}")
 
+def _filter_and_trim_worker(args):
+
+    fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, max_ee = args
+    filt_path = os.path.join(output_dir, "filtered_sequences")
+    filtF = os.path.join(filt_path, f"{sample_name}_F_filt.fastq.gz")
+    filtR = os.path.join(filt_path, f"{sample_name}_R_filt.fastq.gz")
+
+    logger.info(f"--- Processing sample '{sample_name}' from files: {os.path.basename(fnF)} & {os.path.basename(fnR)} ---")
+
+    try:
+        # Open input files (handles .gz or plain text)
+        open_f = gzip.open if fnF.lower().endswith('.gz') else open
+        open_r = gzip.open if fnR.lower().endswith('.gz') else open
+
+        with open_f(fnF, 'rt') as f_in, open_r(fnR, 'rt') as r_in:
+            records_f_iter = SeqIO.parse(f_in, 'fastq')
+            records_r_iter = SeqIO.parse(r_in, 'fastq')
+
+            kept_records_f = []
+            kept_records_r = []
+            initial_count = 0
+
+            for rec_f, rec_r in zip(records_f_iter, records_r_iter):
+                initial_count += 1
+                if (len(rec_f) >= trunc_len_f and
+                    len(rec_r) >= trunc_len_r and
+                    np.mean(rec_f.letter_annotations['phred_quality']) >= 30 and
+                    np.mean(rec_r.letter_annotations['phred_quality']) >= 30):
+
+                    kept_records_f.append(rec_f[:trunc_len_f])
+                    kept_records_r.append(rec_r[:trunc_len_r])
+
+        final_count = len(kept_records_f)
+        if initial_count > 0:
+            logger.info(f"[{sample_name}] Initial read pairs: {initial_count}")
+            logger.info(f"[{sample_name}] Read pairs remaining after filtering: {final_count} ({final_count/initial_count:.2%})")
+        else:
+            logger.warning(f"[{sample_name}] No read pairs found in the input files.")
+            return None, None
+
+
+        if not kept_records_f:
+            logger.error(f"[{sample_name}] Zero read pairs remaining after filtering. Check truncation lengths and data quality.")
+            return None, None
+
+        with gzip.open(filtF, 'wt') as f_out:
+            SeqIO.write(kept_records_f, f_out, 'fastq')
+        with gzip.open(filtR, 'wt') as r_out:
+            SeqIO.write(kept_records_r, r_out, 'fastq')
+
+        return filtF, filtR
+
+    except Exception as e:
+        logger.error(f"Error processing sample {sample_name}: {e}", exc_info=True)
+        return None, None
+
 def filter_and_trim(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee):
     """
-    Filter and trim FASTQ sequences based on quality and length parameters.
-    
-    Args:
-        fnFs: List of forward FASTQ file paths
-        fnRs: List of reverse FASTQ file paths
-        sample_names: List of sample names
-        output_dir: Directory to save filtered files
-        trunc_len_f: Forward truncation length
-        trunc_len_r: Reverse truncation length
-        max_ee: Maximum expected errors [forward, reverse]
-    
-    Returns:
-        tuple: (filtered_forward_filenames, filtered_reverse_filenames)
+    Filter and trim FASTQ sequences in parallel using a multiprocessing Pool.
     """
     try:
         filt_path = os.path.join(output_dir, "filtered_sequences")
         if not os.path.exists(filt_path):
             os.makedirs(filt_path)
-        filtFs = [os.path.join(filt_path, f"{name}_F_filt.fastq.gz") for name in sample_names]
-        filtRs = [os.path.join(filt_path, f"{name}_R_filt.fastq.gz") for name in sample_names]
-        
-        for fnF, fnR, filtF, filtR in zip(fnFs, fnRs, filtFs, filtRs):
-            if fnF.startswith('data:'):
-                records_f = list(SeqIO.parse(StringIO(fnF.split(',')[1]), 'fastq'))
-                records_r = list(SeqIO.parse(StringIO(fnR.split(',')[1]), 'fastq'))
-            else:
-                records_f = list(SeqIO.parse(gzip.open(fnF, 'rt'), 'fastq'))
-                records_r = list(SeqIO.parse(gzip.open(fnR, 'rt'), 'fastq'))
-            filtered_f = [r for r in records_f if len(r) >= trunc_len_f and np.mean(r.letter_annotations['phred_quality']) >= 30]
-            filtered_r = [r for r in records_r if len(r) >= trunc_len_r and np.mean(r.letter_annotations['phred_quality']) >= 30]
-            filtered_f = [r[:trunc_len_f] for r in filtered_f]
-            filtered_r = [r[:trunc_len_r] for r in filtered_r]
-            with gzip.open(filtF, 'wt') as f:
-                SeqIO.write(filtered_f[:min(len(filtered_f), len(filtered_r))], f, 'fastq')
-            with gzip.open(filtR, 'wt') as f:
-                SeqIO.write(filtered_r[:min(len(filtered_f), len(filtered_r))], f, 'fastq')
-        logger.info(f"Filtered sequences to: {filt_path}")
+
+        if not fnFs or not fnRs:
+            logger.error("filter_and_trim was called with empty file lists (fnFs or fnRs).")
+            return None, None
+
+        # Prepare arguments for each worker process
+        args_list = [
+            (fnF, fnR, sample_name, output_dir, trunc_len_f, trunc_len_r, max_ee)
+            for fnF, fnR, sample_name in zip(fnFs, fnRs, sample_names)
+        ]
+
+        # Use a multiprocessing Pool to process files in parallel
+        # We wrap this in a `if __name__ == '__main__':` block in the main script
+        # to ensure it works correctly on all platforms (especially Windows).
+        with multiprocessing.Pool() as pool:
+            results = pool.map(_filter_and_trim_worker, args_list)
+
+        # Process the results to separate the filtered file paths
+        filtFs = [res[0] for res in results if res and res[0]]
+        filtRs = [res[1] for res in results if res and res[1]]
+
+        if not filtFs or not filtRs or len(filtFs) != len(filtRs):
+            logger.error("Parallel filtering and trimming failed to produce valid output for some samples. Aborting.")
+            return None, None
+
+        logger.info(f"Successfully filtered and trimmed all sequences in parallel to: {filt_path}")
         return filtFs, filtRs
+
     except Exception as e:
-        logger.error(f"Error filtering and trimming sequences: {e}")
+        logger.error(f"Error in parallel filtering and trimming orchestrator: {e}", exc_info=True)
         return None, None
 
-def process_sequences(filtFs, filtRs, sample_names, silva, output_dir):
+from collections import defaultdict
+
+import subprocess
+
+import subprocess
+import os 
+
+def denoise_and_create_asv_table_vsearch(filtFs, filtRs, sample_names, output_dir):
     """
-    Process filtered FASTQ files to create ASV table and taxonomy table.
+    Denoises sequences and creates an ASV table using vsearch.
+    This version corrects the order of operations and includes robust checks and safe cleanup.
+    """
+    vsearch_executable = r"C:\Users\schwert\.conda\envs\Environment_Python_Microbiome_Project\vsearch-2.30.0-win-x86_64\bin\vsearch.exe"
+    
+    if not os.path.exists(vsearch_executable):
+        raise FileNotFoundError(f"vsearch not found at: {vsearch_executable}")
+
+    merged_fasta = os.path.join(output_dir, 'all_samples_merged.fa')
+    derep_fasta = os.path.join(output_dir, 'all_samples_derep.fa')
+    denoised_fasta = os.path.join(output_dir, 'asvs.fa')
+    asv_table_tsv = os.path.join(output_dir, 'asv_table.tsv')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    temp_files_to_clean = [merged_fasta, derep_fasta, denoised_fasta, asv_table_tsv]
+
+    try:
+        # Step 1: Merge Paired-End Reads IN PARALLEL
+        logger.info(f"Step 1/5: Merging paired-end reads in parallel using {CPU_CORES} cores...")
+        
+        args_list = [(fF, fR, s_name, vsearch_executable, output_dir) for fF, fR, s_name in zip(filtFs, filtRs, sample_names)]
+        with multiprocessing.Pool(processes=CPU_CORES) as pool:
+            merged_fastq_files  = pool.map(merge_worker, args_list)
+        
+        # Combine the individually merged FASTQ files into one FASTA file
+        with open(merged_fasta, 'w') as merged_output_file:
+            for fq_file in merged_fastq_files:
+                if fq_file and os.path.exists(fq_file):
+                    with open(fq_file, 'rt') as fq_in:
+                        SeqIO.convert(fq_in, 'fastq', merged_output_file, 'fasta')
+                    os.remove(fq_file)
+        # Step 2: Dereplicate sequences
+        logger.info("Step 2/5: Dereplicating all merged sequences...")
+        derep_cmd = [vsearch_executable, '--derep_fulllength', merged_fasta, '--output', derep_fasta, '--sizeout','--threads', str(CPU_CORES)]
+        try:
+            subprocess.run(derep_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"vsearch dereplication failed. Stderr: {e.stderr}")
+            raise
+        
+        if not os.path.exists(derep_fasta) or os.path.getsize(derep_fasta) == 0:
+            raise FileNotFoundError("Step 2 (Dereplication) failed: Dereplicated FASTA file was not created or is empty.")
+
+        # Step 3: Denoise (form ASVs)
+        logger.info("Step 3/5: Denoising sequences with cluster_unoise...")
+        unoise_cmd = [vsearch_executable, '--cluster_unoise', derep_fasta, '--minsize', '8', '--centroids', denoised_fasta,'--relabel', 'ASV_','--threads', str(CPU_CORES)]
+        try:
+            subprocess.run(unoise_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"vsearch denoising failed. Stderr: {e.stderr}")
+            raise
+        
+        if not os.path.exists(denoised_fasta) or os.path.getsize(denoised_fasta) == 0:
+            raise FileNotFoundError("Step 3 (Denoising) failed: ASV centroids FASTA file (asvs.fa) was not created or is empty.")
+
+        # Step 4: Map original merged reads to ASVs to generate table
+        logger.info("Step 4/5: Mapping reads to ASVs to generate feature table...")
+        map_cmd = [
+            vsearch_executable, '--usearch_global', merged_fasta, '--db', denoised_fasta, 
+            '--id', '1.0', '--otutabout', asv_table_tsv,'--threads', str(CPU_CORES)
+        ]
+        try:
+            subprocess.run(map_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"vsearch mapping (otutabout) failed. Stderr: {e.stderr}")
+            raise
+
+        logger.info("Step 5/5: Formatting ASV table...")
+        if not os.path.exists(asv_table_tsv) or os.path.getsize(asv_table_tsv) == 0:
+            logger.warning("vsearch did not produce an ASV table in Step 4. This likely means no reads mapped to the ASVs.")
+            return pd.DataFrame()
+
+        asv_table = pd.read_csv(asv_table_tsv, sep='\t', index_col=0).T
+        
+        asv_sequences_dict = {
+            record.id.split(';')[0]: str(record.seq) 
+            for record in SeqIO.parse(denoised_fasta, 'fasta')
+        }
+        
+        new_columns = [asv_sequences_dict.get(col_id) for col_id in asv_table.columns]
+        if any(seq is None for seq in new_columns):
+             raise KeyError("ID mismatch error: Some ASV table columns could not be found in the ASV FASTA file.")
+        asv_table.columns = new_columns
+        
+        logger.info(f"Successfully generated ASV table with {asv_table.shape[0]} samples and {asv_table.shape[1]} unique ASVs.")
+        final_asv_path = os.path.join(output_dir, 'microbiome_ai_16s_asv.csv')
+        asv_table.to_csv(final_asv_path, sep='\t')
+        logger.info(f"Final ASV table saved to {final_asv_path}")
+        
+        return asv_table
+
+    finally:
+        pass
+#        logger.info("Cleaning up temporary vsearch files...")
+#        for f_path in temp_files_to_clean:
+#            if os.path.exists(f_path):
+#                try:
+#                    os.remove(f_path)
+#                except OSError as e:
+#                    logger.warning(f"Could not remove temporary file {f_path}: {e}")
+
+def assign_taxonomy(asv_sequences, asv_fasta_path, silva_path, output_dir):
+    """
+    Assigns taxonomy using the fast vsearch --usearch_global command,
+    replacing the slow, brute-force Python loop.
     
     Args:
-        filtFs: List of filtered forward FASTQ files
-        filtRs: List of filtered reverse FASTQ files
-        sample_names: List of sample names
-        silva: SILVA database content (base64 encoded)
-        output_dir: Directory to save output files
-    
+        asv_sequences (list): List of ASV sequences (used for final table index).
+        asv_fasta_path (str): Path to the ASV FASTA file (e.g., 'asvs.fa').
+        silva_path (str): Path to the SILVA reference database.
+        output_dir (str): Directory to save output files.
+        
     Returns:
-        tuple: (sequence_table, taxa_table)
+        pd.DataFrame: The final taxonomy table.
     """
+    logger.info("Starting fast taxonomy assignment with vsearch.")
+    
+    if not asv_sequences:
+        logger.warning("assign_taxonomy was called with an empty list of sequences. Returning empty table.")
+        return pd.DataFrame(columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus','Species'])
+
+    if not silva_path or not os.path.exists(silva_path):
+        logger.error(f"SILVA reference file not found at path: {silva_path}. Cannot assign taxonomy.")
+        tax_df = pd.DataFrame(index=asv_sequences, columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus','Species'])
+        tax_df.fillna("Unassigned", inplace=True)
+        return tax_df
+
+    # --- START: New High-Performance Logic ---
+    vsearch_executable = r"C:\Users\schwert\.conda\envs\Environment_Python_Microbiome_Project\vsearch-2.30.0-win-x86_64\bin\vsearch.exe"
+    if not os.path.exists(vsearch_executable):
+        raise FileNotFoundError(f"vsearch not found at: {vsearch_executable}. Please update the path.")
+
+    # Define the output path for the blast6-like results
+    blast6_output = os.path.join(output_dir, 'taxonomy_hits.tsv')
+    
+    # Run vsearch to find the best hit for each ASV against the SILVA database
+    # This is incredibly fast compared to the Python loop.
+    tax_cmd = [
+        vsearch_executable,
+        '--usearch_global', asv_fasta_path,
+        '--db', silva_path,
+        '--id', '0.97',  # 97% identity, a common threshold for species/genus
+        '--strand', 'plus',
+        '--maxaccepts', '1', # We only want the single best hit
+        '--blast6out', blast6_output,
+        '--threads', str(CPU_CORES)
+
+    ]
+    
     try:
-        seqtab = []
-        for filtF, filtR in zip(filtFs, filtRs):
-            records_f = list(SeqIO.parse(gzip.open(filtF, 'rt'), 'fastq'))
-            seqs = [str(r.seq) for r in records_f]
-            counts = pd.Series(seqs).value_counts()
-            seqtab.append(counts)
-        seqtab = pd.DataFrame(seqtab, index=sample_names).fillna(0)
-        
-        taxa = []
-        for seq in seqtab.columns:
-            taxa.append(['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus'])
-        taxa = pd.DataFrame(taxa, index=seqtab.columns, columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus'])
-        
-        seqtab.to_csv(os.path.join(output_dir, 'microbiome_ai_16s_asv.csv'), sep='\t')
-        taxa.to_csv(os.path.join(output_dir, 'microbiome_ai_taxonomy.csv'), sep='\t')
-        
-        logger.info(f"Processed sequences to: {output_dir}")
-        return seqtab, taxa
-    except Exception as e:
-        logger.error(f"Error processing sequences: {e}")
-        return None, None
+        logger.info("Running vsearch for taxonomy assignment... This should be fast.")
+        subprocess.run(tax_cmd, check=True, capture_output=True, text=True)
+        logger.info(f"vsearch completed. Taxonomy hits saved to {blast6_output}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"vsearch taxonomy assignment failed. Stderr: {e.stderr}")
+        raise
+
+    # Parse the vsearch output to create the taxonomy table
+    # Columns: 0=ASV_ID, 1=SILVA_ID_with_taxonomy
+    hits_map = {}
+    if os.path.exists(blast6_output):
+        with open(blast6_output, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                asv_id = parts[0]
+                silva_full_header = parts[1]
+                hits_map[asv_id] = silva_full_header
+
+    # Create the final taxonomy DataFrame
+    taxonomy_results = {}
+    asv_id_to_seq = {rec.id: str(rec.seq) for rec in SeqIO.parse(asv_fasta_path, "fasta")}
+
+    for asv_id, asv_seq in asv_id_to_seq.items():
+        if asv_id in hits_map:
+            # Found a hit, parse the taxonomy string
+            silva_header = hits_map[asv_id]
+            # Assuming format like: "AB12345.1.1234 Bacteria;Firmicutes;..."
+            tax_string = silva_header.split(' ', 1)[-1] 
+            tax_levels = tax_string.split(';')
+            parsed_tax = [level.split('__')[-1] if '__' in level else level for level in tax_levels]
+            # Pad with last known level if taxonomy is incomplete
+            while len(parsed_tax) < 7:
+                parsed_tax.append(parsed_tax[-1] if parsed_tax else 'Unassigned')
+            taxonomy_results[asv_seq] = parsed_tax[:7] # Only take first 6 levels
+        else:
+            # No hit found for this ASV
+            taxonomy_results[asv_seq] = ['Unassigned'] * 7
+
+    tax_df = pd.DataFrame.from_dict(taxonomy_results, orient='index',
+                                    columns=['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus','Species'])
+    tax_df.index.name = 'ASV'
+    # --- END: New High-Performance Logic ---
+
+    tax_table_path = os.path.join(output_dir, 'microbiome_ai_taxonomy.csv')
+    tax_df.to_csv(tax_table_path)
+    logger.info(f"Taxonomy assignment complete. Table saved to: {tax_table_path}")
+    return tax_df
+
 
 def create_phyloseq_object(seqtab, taxa, metadata):
     """
@@ -569,46 +839,146 @@ def create_phyloseq_object(seqtab, taxa, metadata):
     except Exception as e:
         logger.error(f"Error creating phyloseq object: {e}")
         return None
-
 def calculate_alpha_diversity(ps1, treatment):
     """
-    Calculate alpha diversity metrics for samples in phyloseq object.
-    
-    Args:
-        ps1: Phyloseq object
-        treatment: Column name for grouping
-    
-    Returns:
-        DataFrame: Metadata with Shannon and InverseSimpson diversity metrics
+    Calculates Shannon alpha diversity on a sample-by-sample basis.
     """
     try:
+        logger.info("Calculating Alpha Diversity...")
         meta = ps1['meta'].copy()
-        asv = ps1['asv']
-        shannon = alpha_diversity('shannon', asv, ids=asv.index)
-        simpson = alpha_diversity('simpson', asv, ids=asv.index)
-        meta['Shannon'] = shannon
-        meta['InverseSimpson'] = 1 / (1 - simpson)
-        meta[treatment] = meta[treatment].astype(str)
-        global_data['ps1.meta'] = meta
-        logger.info("Calculated alpha diversity")
+        asv_table = ps1['asv'] # Shape is (ASVs, Samples)
+
+        # Transpose the table so samples are rows and ASVs are columns
+        asv_table_transposed = asv_table.T # Shape is now (Samples, ASVs)
+        
+        counts_matrix = asv_table_transposed.astype(int).values
+        sample_ids = asv_table_transposed.index
+
+        if asv_table_transposed.empty:
+            logger.warning("ASV table is empty. Cannot calculate alpha diversity.")
+            meta['Shannon'] = 0.0
+            return meta
+
+        # Calculate Shannon diversity using the correctly oriented data
+        shannon_values = alpha_diversity('shannon', counts_matrix, ids=sample_ids)
+        
+        # Add the results back to the original metadata dataframe
+        meta['Shannon'] = shannon_values
+        
+        logger.info("Alpha diversity calculation successful.")
         return meta
+
     except Exception as e:
-        logger.error(f"Error calculating alpha diversity: {e}")
-        return None
+        logger.error(f"Error in calculate_alpha_diversity: {e}", exc_info=True)
+        meta['Shannon'] = 0.0
+        return meta
+def perform_pairwise_alpha_tests(alpha_df, treatment_col, p_adjust_method='fdr_bh'):
+    """
+    Performs pairwise Mann-Whitney U tests for Shannon diversity
+    between all combinations of treatment groups and corrects for multiple testing.
+    """
+    groups = alpha_df[treatment_col].unique()
+    if len(groups) < 2:
+        return pd.DataFrame() # Not enough groups to compare
+        
+    pairs = list(combinations(groups, 2))
+    results = []
+    
+    for group1, group2 in pairs:
+        data1 = alpha_df['Shannon'][alpha_df[treatment_col] == group1]
+        data2 = alpha_df['Shannon'][alpha_df[treatment_col] == group2]
+        stat, p_raw = mannwhitneyu(data1, data2, alternative='two-sided')
+        results.append({'group1': group1, 'group2': group2, 'p_raw': p_raw})
+    
+    if not results:
+        return pd.DataFrame()
+
+    results_df = pd.DataFrame(results)
+    
+    p_values_raw = results_df['p_raw'].tolist()
+    reject, p_adjusted, _, _ = multipletests(p_values_raw, alpha=0.05, method=p_adjust_method)
+    
+    results_df['p_adj'] = p_adjusted
+    results_df['significant'] = reject
+    
+    return results_df
+def add_stat_annotations(fig, alpha_df, treatment_col, stats_df):
+    """
+    Adds statistical annotation brackets and p-values to a Plotly violin plot.
+    This is the final corrected version that gets the x-axis order correctly.
+    """
+    # --- THIS IS THE CORRECTED LOGIC ---
+    # Get the unique group names IN THE ORDER THEY APPEAR IN THE DATAFRAME.
+    # Plotly will typically plot them in this order.
+    unique_groups = alpha_df[treatment_col].unique()
+    group_order = list(unique_groups)
+    
+    # Create the mapping from group name to its numerical position (0, 1, 2, ...)
+    group_positions = {group: i for i, group in enumerate(group_order)}
+    
+    # Find the overall maximum height of the violins
+    y_max = alpha_df['Shannon'].max()
+    y_step = y_max * 0.15
+    y_current = y_max + y_step
+
+    # Filter for significant comparisons only
+    significant_pairs = stats_df[stats_df['significant']].sort_values('p_adj')
+
+    if significant_pairs.empty:
+        return fig # Nothing to draw
+
+    for _, row in significant_pairs.iterrows():
+        group1 = row['group1']
+        group2 = row['group2']
+        p_adj = row['p_adj']
+
+        # Use the position mapping to find the x-coordinates
+        x1 = group_positions.get(group1)
+        x2 = group_positions.get(group2)
+
+        if x1 is None or x2 is None:
+            continue
+
+        # Format the p-value for display
+        if p_adj < 0.001:
+            p_text = "p < 0.001"
+        else:
+            p_text = f"p = {p_adj:.3f}"
+
+        # Add the annotation bracket
+        fig.add_shape(type="line", x0=x1, y0=y_current, x1=x2, y1=y_current, line=dict(color='black', width=1))
+        fig.add_shape(type="line", x0=x1, y0=y_current - (y_step*0.1), x1=x1, y1=y_current, line=dict(color='black', width=1))
+        fig.add_shape(type="line", x0=x2, y0=y_current - (y_step*0.1), x1=x2, y1=y_current, line=dict(color='black', width=1))
+
+        # Add the p-value text
+        fig.add_annotation(x=(x1 + x2) / 2, y=y_current + (y_step*0.1), text=p_text, showarrow=False, font=dict(size=10))
+        
+        y_current += y_step
+    
+    # Update the y-axis to make sure all annotations are visible
+    fig.update_yaxes(range=[alpha_df['Shannon'].min()*0.9, y_current])
+    
+    return fig
+       
 
 def calculate_beta_diversity(ps1):
     """
-    Calculate beta diversity metrics for samples in phyloseq object.
-    
-    Args:
-        ps1: Phyloseq object
-    
-    Returns:
-        tuple: (relative_abundance_table, metadata)
+    Calculates beta diversity.
+    Includes a crucial step to remove ASVs with zero reads in the current subset.
     """
     try:
-        asv = ps1['asv']
-        asv_rel = asv.div(asv.sum(axis=1), axis=0)
+        asv = ps1['asv'] # This is the (potentially subsetted) ASV table (ASVs x Samples)
+        
+        # Sum reads for each ASV (row)
+        asv_sums = asv.sum(axis=1) 
+        # Find ASVs where the sum is greater than 0
+        asvs_to_keep = asv_sums[asv_sums > 0].index
+        
+        # Keep only those ASVs
+        asv_filtered = asv.loc[asvs_to_keep]
+        
+        # Now, calculate relative abundance on the cleaned table
+        asv_rel = asv_filtered.div(asv_filtered.sum(axis=1), axis=0)
         global_data['pseq'] = {'asv_rel': asv_rel, 'tax': ps1['tax'], 'meta': ps1['meta']}
         global_data['asv_rel'] = asv_rel
         global_data['meta_rel'] = ps1['meta']
@@ -619,94 +989,620 @@ def calculate_beta_diversity(ps1):
     except Exception as e:
         logger.error(f"Error calculating beta diversity: {e}")
         return None, None
+def perform_pcoa(asv, meta, treatment):
+    """
+    Performs 2D PCoA and returns the scores, distance matrix, AND variance explained.
+    """
+    try:
+        asv_transposed = asv.T
+        dm = beta_diversity('braycurtis', asv_transposed.to_numpy(), ids=asv_transposed.index)
+        
+        ordination_result = pcoa(dm) # Default is 2D
+        
+        scores = ordination_result.samples
+        scores = scores.join(meta[[treatment]])
+        
+        # --- THIS IS THE NEW PART ---
+        # The proportion_explained is a pandas Series containing the % for each axis
+        variance_explained = ordination_result.proportion_explained
+        
+        logger.info("Performed 2D PCoA successfully.")
+        # Return all three results
+        return scores, dm, variance_explained
 
+    except Exception as e:
+        logger.error(f"Error performing PCoA: {e}", exc_info=True)
+        # Return three items on failure as well to avoid errors
+        return None, None, None
+    from skbio.stats.distance import permanova
+
+def run_permanova(distance_matrix, metadata_df, treatment_column):
+    """
+    Performs a PERMANOVA test on a distance matrix.
+
+    Args:
+        distance_matrix (skbio.DistanceMatrix): The beta diversity distance matrix (e.g., Bray-Curtis).
+        metadata_df (pd.DataFrame): The metadata dataframe.
+        treatment_column (str): The column in the metadata to test for significance.
+        
+    Returns:
+        A Dash html.Div component with the formatted result.
+    """
+    try:
+        # The permanova function from skbio does all the work.
+        # It requires the grouping variable (your treatment column) and the distance matrix.
+        results = permanova(distance_matrix, metadata_df, column=treatment_column)
+        
+        # Extract the key results from the output series
+        p_value = results['p-value']
+        test_statistic = results['test statistic']
+        
+        # Format the output for display
+        header = html.H4("Beta Diversity Significance (PERMANOVA)")
+        p_value_text = f"P-value: {p_value:.4f}"
+        stat_text = f"Test Statistic (pseudo-F): {test_statistic:.4f}"
+        
+        # Add a simple interpretation
+        if p_value < 0.05:
+            interpretation = "The difference in community composition between groups is statistically significant (p < 0.05)."
+            return html.Div([
+                header,
+                html.P(p_value_text),
+                html.P(stat_text),
+                html.P(interpretation, style={'color': 'green', 'fontWeight': 'bold'})
+            ])
+        else:
+            interpretation = "The difference in community composition between groups is not statistically significant (p >= 0.05)."
+            return html.Div([
+                header,
+                html.P(p_value_text),
+                html.P(stat_text),
+                html.P(interpretation, style={'color': 'red', 'fontWeight': 'bold'})
+            ])
+            
+    except Exception as e:
+        logger.error(f"Could not calculate PERMANOVA: {e}")
+        return html.Div([
+            html.H4("Beta Diversity Significance (PERMANOVA)"),
+            html.P(f"Error calculating PERMANOVA: {e}")
+        ])
 def perform_pca(asv, top_n):
     """
     Perform PCA on top N ASVs.
-    
-    Args:
-        asv: asv table
-        top_n: Number of top ASVs to include
-    
-    Returns:
-        tuple: (PCA results, explained variance ratios)
+    This version corrects the data orientation for scikit-learn.
     """
     try:
         from sklearn.preprocessing import StandardScaler
         from sklearn.decomposition import PCA
-        top_asvs = asv.sum().nlargest(top_n).index
-        asv_top = asv[top_asvs]
+        
+        top_asvs = asv.sum(axis=1).nlargest(top_n).index
+        asv_top = asv.loc[top_asvs]
+        
+        asv_top_transposed = asv_top.T
+        
         scaler = StandardScaler()
-        asv_scaled = scaler.fit_transform(asv_top)
-        pca = PCA(n_components=5)
+        asv_scaled = scaler.fit_transform(asv_top_transposed)
+        
+        pca = PCA(n_components=2)
         pca_result = pca.fit_transform(asv_scaled)
+        
         explained_variance = pca.explained_variance_ratio_
+        
         logger.info("Performed PCA successfully")
         return pca_result, explained_variance
+        
     except Exception as e:
-        logger.error(f"Error performing PCA: {e}")
+        logger.error(f"Error performing PCA: {e}", exc_info=True)
         return None, None
-
-def perform_pcoa(asv, meta, treatment, pval_threshold, contrib_threshold):
+def perform_nmds(distance_matrix):
     """
-    Perform PCoA on beta diversity distance matrix.
-    
-    Args:
-        asv: asv table
-        meta: Metadata DataFrame
-        treatment: Column name for grouping
-        pval_threshold: P-value threshold for significance
-        contrib_threshold: Contribution threshold for vectors
-    
-    Returns:
-        tuple: (PCoA scores, distance matrix)
+    Performs Non-metric Multidimensional Scaling (NMDS) using scikit-learn.
     """
     try:
-        dm = beta_diversity('braycurtis', asv)
-        ordination = pcoa(dm)
-        scores = pd.DataFrame(ordination.samples, index=asv.index)
-        scores = scores.join(meta[[treatment]])
-        logger.info("Performed PCoA successfully")
-        return scores, dm
-    except Exception as e:
-        logger.error(f"Error performing PCoA: {e}")
-        return None, None
+        logger.info("Performing NMDS with scikit-learn...")
+        
+        # scikit-learn's MDS function works directly on the distance matrix data
+        dm_array = distance_matrix.to_data_frame().values
 
-def plot_phylogenetic_tree(seqtab):
+        # Initialize the NMDS model
+        # n_components=2 for a 2D plot
+        # metric=False for non-metric MDS
+        # n_init=20 runs the algorithm multiple times to find the best layout
+        # dissimilarity='precomputed' tells the model we are giving it a distance matrix
+        nmds_model = MDS(
+            n_components=2, 
+            metric=False, 
+            n_init=20, 
+            dissimilarity='precomputed',
+            random_state=42 # for reproducibility
+        )
+
+        # Fit the model and get the coordinates for the plot
+        nmds_scores = nmds_model.fit_transform(dm_array)
+        
+        # The stress value is a measure of how well the 2D plot represents the original data
+        nmds_stress = nmds_model.stress_
+
+        logger.info(f"scikit-learn NMDS completed with stress: {nmds_stress:.4f}")
+        
+        # Return the scores and the stress value as a pandas DataFrame
+        return pd.DataFrame(nmds_scores, index=distance_matrix.ids, columns=['NMDS1', 'NMDS2']), nmds_stress
+        
+    except Exception as e:
+        logger.error(f"Error performing NMDS: {e}", exc_info=True)
+        return None, None
+def plot_phylogenetic_tree(seqtab, taxa, indicator_df=None):
     """
-    Generate a phylogenetic tree from ASV sequences.
-    
-    Args:
-        seqtab: ASV table
-    
-    Returns:
-        str: Base64 encoded PNG image of the tree
+    Generates an improved phylogenetic tree.
+    - Uses a circular layout.
+    - Colors leaves by Phylum.
+    - Highlights significant indicator ASVs.
     """
+    # We import all necessary components from ete3 here
+    from ete3 import Tree, TreeStyle, NodeStyle, CircleFace, TextFace
+    from skbio.tree import nj as skbio_nj
+    from Bio import Align
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    
     try:
-        seqs = [SeqRecord(Seq(seq), id=f"ASV{i+1}") for i, seq in enumerate(seqtab.columns)]
+        # Step 1: Build the tree using DNA sequences as IDs
+        all_seqs = [SeqRecord(Seq(seq), id=seq) for seq in seqtab.columns]
+        unique_seqs = {str(rec.seq): rec for rec in all_seqs}
+        seqs_for_tree = list(unique_seqs.values())
+        
+        if len(seqs_for_tree) < 4: # NJ algorithm needs at least 4 items
+            logger.warning("Cannot generate a tree with fewer than 4 unique sequences.")
+            return None
+        
+        # --- THIS IS THE CORRECTED DISTANCE MATRIX CALCULATION ---
+        names = [s.id for s in seqs_for_tree]
+        num_seqs = len(seqs_for_tree)
+        dm_data = np.zeros((num_seqs, num_seqs))
         aligner = Align.PairwiseAligner()
-        alignments = []
-        for i in range(len(seqs)):
-            for j in range(i + 1, len(seqs)):
-                alignments.append(aligner.align(seqs[i].seq, seqs[j].seq)[0])
-        dm = np.ones((len(seqs), len(seqs)))
-        for i in range(len(seqs)):
-            dm[i, i] = 0
-        dm = DistanceMatrix(dm, ids=[s.id for s in seqs])
-        tree = nj(dm)
-        global_data['treeNJ'] = tree
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            tree.render(tmp.name, w=400, units='px')
-            with open(tmp.name, f'rb') as f:
-                encoded_image = base64.b64encode(f.read()).decode('utf-8')
-            os.remove(tmp.name)
-        logger.info("Generated phylogenetic tree successfully")
-        return f"data:image/png;base64,{encoded_image}"
-    except Exception as e:
-        logger.error(f"Error plotting phylogenetic tree: {e}")
-        return None
+        aligner.mode = 'global'
+        for i in range(num_seqs):
+            for j in range(i + 1, num_seqs):
+                score = aligner.align(seqs_for_tree[i].seq, seqs_for_tree[j].seq).score
+                max_len = max(len(seqs_for_tree[i].seq), len(seqs_for_tree[j].seq))
+                distance = 1 - (score / max_len) if max_len > 0 else 1
+                dm_data[i, j] = distance
+                dm_data[j, i] = distance
+        
+        dm = DistanceMatrix(dm_data, ids=names)
+        skbio_tree = skbio_nj(dm)
+        handle = io.StringIO()
+        skbio_tree.write(handle, format='newick')
+        newick_string = handle.getvalue()
+        ete_tree = Tree(newick_string)
 
+        # --- Step 2: Decorate the tree with colors and highlights ---
+        top_phyla = taxa['Phylum'].value_counts().nlargest(10).index
+        colors = px.colors.qualitative.Plotly
+        phylum_colors = {phylum: colors[i % len(colors)] for i, phylum in enumerate(top_phyla)}
+
+        for i, leaf in enumerate(ete_tree.iter_leaves()):
+            asv_sequence = leaf.name
+            
+            nstyle = NodeStyle()
+            nstyle["size"] = 8
+            nstyle["fgcolor"] = "black"
+
+            if asv_sequence in taxa.index:
+                phylum = taxa.loc[asv_sequence, 'Phylum']
+                nstyle["bgcolor"] = phylum_colors.get(phylum, "lightgrey")
+                
+                # --- THIS IS THE CORRECTED HIGHLIGHTING LOGIC ---
+                if indicator_df is not None and not indicator_df.empty and 'ASV' in indicator_df.columns:
+                    if asv_sequence in indicator_df['ASV'].values:
+                        nstyle["fgcolor"] = "red"  # Red border for indicator
+                        nstyle["size"] = 12       # Make it bigger
+
+            leaf.set_style(nstyle)
+            leaf.name = f"ASV_{taxa.index.get_loc(asv_sequence) + 1}"
+
+        # --- Step 3: Set the final tree style and legend ---
+        ts = TreeStyle()
+        ts.mode = "c"
+        ts.scale = 20
+        ts.branch_vertical_margin = 10
+        ts.show_leaf_name = True
+
+        for phylum, color in phylum_colors.items():
+            if pd.notna(phylum): # Check that phylum is not NaN
+                ts.legend.add_face(CircleFace(10, color), column=0)
+                ts.legend.add_face(TextFace(f" {phylum}", fsize=10), column=1)
+
+        # --- Step 4: Render the tree to an image ---
+        tmp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                tmp_file_path = f.name
+
+            ete_tree.render(tmp_file_path, w=1200, units='px', tree_style=ts)
+
+            with open(tmp_file_path, 'rb') as image_file:
+                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+            logger.info("Generated decorated phylogenetic tree successfully")
+            return f"data:image/png;base64,{encoded_image}"
+
+        finally:
+            if tmp_file_path and os.path.exists(tmp_file_path):
+                os.remove(tmp_file_path)
+        
+    except Exception as e:
+        logger.error(f"Error plotting phylogenetic tree: {e}", exc_info=True)
+        return None
+def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01):
+    """
+    Creates a bar plot of mean relative abundance at the Order level that correctly sums to 100%.
+    Orders with a mean abundance below the threshold are grouped into 'Other'.
+    """
+    try:
+        logger.info("Generating abundance plot at Order level...")
+        
+        # --- 1. Prepare the Data ---
+        # Start with the ABSOLUTE counts, not relative abundance yet.
+        asv_table = ps1_object['asv'] # Shape is (ASVs, Samples)
+        
+        # Melt to long format
+        melted_df = asv_table.stack().reset_index()
+        melted_df.columns = ['ASV', 'SampleID', 'Abundance']
+        
+        # Merge with taxonomy and metadata
+        melted_df = melted_df.merge(ps1_object['tax']['Order'], on='ASV')
+        melted_df = melted_df.merge(ps1_object['meta'][[treatment_column]], left_on='SampleID', right_index=True)
+
+        # --- 2. Calculate Group-Level Abundance ---
+        
+        # Sum the ABSOLUTE counts for each Order within each Treatment Group
+        group_order_sums = melted_df.groupby([treatment_column, 'Order'])['Abundance'].sum().reset_index()
+        
+        # --- 3. Normalize to 100% WITHIN each Treatment Group ---
+        
+        # Calculate the total sum for each treatment group
+        total_sum_per_group = group_order_sums.groupby(treatment_column)['Abundance'].sum()
+        
+        # Map these total sums back to the dataframe
+        group_order_sums['Total'] = group_order_sums[treatment_column].map(total_sum_per_group)
+        
+        # Calculate the true relative abundance
+        group_order_sums['RelativeAbundance'] = group_order_sums['Abundance'] / group_order_sums['Total']
+
+        # --- 4. Group Rare Orders into 'Other' ---
+        
+        # Find which orders are below the threshold based on their new relative abundance
+        rare_orders = group_order_sums.groupby('Order')['RelativeAbundance'].mean()
+        rare_orders = rare_orders[rare_orders < threshold].index
+        
+        # Replace the names of these rare orders with 'Other'
+        group_order_sums['Order'] = group_order_sums['Order'].replace(rare_orders, 'Other')
+        
+        # Now, sum the abundances again to combine all the 'Other' categories
+        final_plot_df = group_order_sums.groupby([treatment_column, 'Order'])['RelativeAbundance'].sum().reset_index()
+
+        # --- 5. Generate the Plot ---
+        
+        fig = px.bar(
+           final_plot_df,
+           x=treatment_column,
+           y='RelativeAbundance',
+           color='Order',
+           title=f"Mean Relative Abundance by Order (>{threshold*100}%)",
+           height=700, width=1000 # <<< Give this one even more height as it has more categories
+       )
+        
+        # Improve layout for readability
+        fig.update_layout(
+            xaxis={'categoryorder':'total descending'},
+            yaxis_title="Mean Relative Abundance",
+            yaxis_tickformat='.0%',
+            legend=dict(
+                orientation="h", # <<< Set legend to horizontal
+                yanchor="bottom",
+                y=-0.5,          # <<< Position legend a bit lower to accommodate long labels
+                xanchor="center",
+                x=0.5
+            )
+        )
+        fig.update_xaxes(tickangle=45)
+        
+        return fig
+
+    except Exception as e:
+        logger.error(f"Could not generate Order-level abundance plot: {e}")
+        return go.Figure(layout_title_text=f"Error: {e}")
+from statsmodels.stats.multitest import multipletests
+
+import scikit_posthocs as sp
+
+def run_differential_abundance(ps1_object, treatment_column):
+    """
+    Performs a robust differential abundance analysis for 2 or more groups.
+    1. Uses Kruskal-Wallis to find Orders that are significant overall.
+    2. For those significant Orders, it performs a Dunn's post-hoc test
+       to find which specific pairs of groups are different.
+    """
+    try:
+        logger.info("Running differential abundance analysis with Kruskal-Wallis and Dunn's post-hoc test...")
+        
+        # --- 1. Prepare Data ---
+        # We start with relative abundance for this test
+        asv_rel = ps1_object['asv'].div(ps1_object['asv'].sum(axis=1), axis=0)
+        taxa = ps1_object['tax']
+        meta = ps1_object['meta']
+        groups = meta[treatment_column].unique()
+
+        if len(groups) < 2:
+            return html.P("At least two groups are needed for this analysis.")
+
+        # Aggregate ASV abundances to the Order level
+        order_abundance = asv_rel.T.join(taxa['Order']).groupby('Order').sum().T.dropna(axis=1)
+
+        # --- 2. Step 1: Find Orders with Overall Significance (Kruskal-Wallis) ---
+        significant_orders_kw = []
+        for order in order_abundance.columns:
+            grouped_values = [order_abundance[order][meta[treatment_column] == g] for g in groups]
+            try:
+                stat, p_raw = kruskal(*grouped_values)
+                if p_raw < 0.05: # Using a standard alpha for the initial gatekeeper
+                    significant_orders_kw.append(order)
+            except ValueError:
+                continue
+        
+        if not significant_orders_kw:
+            return html.Div([
+                html.H4("Differential Abundance by Order"),
+                html.P("No Orders were found to be significantly different in overall abundance across the selected groups (Kruskal-Wallis, p < 0.05).")
+            ])
+
+        # --- 3. Step 2: Dunn's Post-Hoc Test on Significant Orders ---
+        final_results = []
+        for order in significant_orders_kw:
+            order_data_df = pd.DataFrame({
+                'Abundance': order_abundance[order],
+                'Group': meta[treatment_column]
+            })
+            
+            dunn_results = sp.posthoc_dunn(order_data_df, val_col='Abundance', group_col='Group', p_adjust='fdr_bh')
+            
+            significant_pairs = dunn_results.stack().reset_index()
+            significant_pairs.columns = ['Group 1', 'Group 2', 'Adjusted p-value']
+            significant_pairs = significant_pairs[significant_pairs['Adjusted p-value'] < 0.05]
+            
+            for _, row in significant_pairs.iterrows():
+                final_results.append({
+                    'Taxonomic Order': order,
+                    'Comparison': f"{row['Group 1']} vs {row['Group 2']}",
+                    'Adjusted p-value': f"{row['Adjusted p-value']:.4f}"
+                })
+        
+        if not final_results:
+            return html.Div([
+                html.H4("Differential Abundance by Order"),
+                html.P("Found some Orders with overall significance, but no specific pairwise differences were significant after post-hoc correction.")
+            ])
+
+        # --- 4. Format and Display Final Table ---
+        final_df = pd.DataFrame(final_results)
+        # Clean up self-comparisons and duplicates
+        final_df['comparison_set'] = final_df['Comparison'].apply(lambda x: tuple(sorted(x.split(' vs '))))
+        final_df = final_df.drop_duplicates(subset='comparison_set').drop(columns='comparison_set')
+
+        table_header = [html.Thead(html.Tr([html.Th(col) for col in final_df.columns]))]
+        table_body = [html.Tbody([html.Tr([html.Td(final_df.iloc[i][col]) for col in final_df.columns]) for i in range(len(final_df))])]
+        
+        return html.Div([
+            html.H4("Significant Pairwise Differences in Abundance (by Order)"),
+            html.Table(table_header + table_body, style={'marginLeft': 'auto', 'marginRight': 'auto', 'marginTop': '20px'})
+        ])
+
+    except Exception as e:
+        logger.error(f"Differential abundance analysis failed: {e}", exc_info=True)
+        return html.P(f"Error during differential abundance analysis: {e}")    
+def run_indicator_species(ps1_object, treatment_column):
+    """
+    Performs Indicator Species Analysis.
+    This version has consistent return values to prevent unpacking errors.
+    """
+    try:
+        logger.info("Running custom Indicator Species Analysis...")
+        
+        # --- 1. Prepare Data ---
+        asv_rel_table = ps1_object['asv'].div(ps1_object['asv'].sum(axis=1), axis=0).T
+        asv_pa_table = (asv_rel_table > 0).astype(int)
+        groups = ps1_object['meta'][treatment_column]
+        unique_groups = groups.unique()
+
+        if len(unique_groups) < 2:
+            html_output = html.P("At least two groups are needed for Indicator Species Analysis.")
+            return html_output, pd.DataFrame() # Return 2 items
+
+        # --- 2. Calculate Indicator Score for Each ASV in Each Group ---
+        indicator_results = []
+        for group in unique_groups:
+            # Get the sample names for the target group and all other groups
+            target_samples = groups[groups == group].index
+            other_samples = groups[groups != group].index
+            
+            for asv in asv_pa_table.columns:
+                # --- Specificity Calculation ---
+                # How many times does the ASV appear in the target group?
+                in_target_count = asv_pa_table.loc[target_samples, asv].sum()
+                # How many times does it appear in total?
+                total_count = asv_pa_table[asv].sum()
+                if total_count == 0: continue # Skip if ASV is not present anywhere
+                
+                specificity = in_target_count / total_count
+                
+                # --- Fidelity Calculation ---
+                # In what proportion of target group samples is the ASV present?
+                fidelity = in_target_count / len(target_samples)
+                
+                # Calculate the final indicator score
+                indicator_score = specificity * fidelity
+
+                # --- Statistical Test ---
+                # Compare the abundance in the target group vs. all other groups
+                target_abund = asv_rel_table.loc[target_samples, asv]
+                other_abund = asv_rel_table.loc[other_samples, asv]
+                
+                # Check for variance before testing
+                if target_abund.var() == 0 and other_abund.var() == 0: continue
+
+                stat, p_value = mannwhitneyu(target_abund, other_abund, alternative='greater')
+                
+                indicator_results.append({
+                    'ASV': asv,
+                    'Associated Group': group,
+                    'Indicator Score': indicator_score,
+                    'p_value': p_value
+                })
+
+        if not indicator_results:
+            html_output = html.Div([html.H4("Indicator ASV Analysis"), html.P("No valid indicator scores could be calculated.")])
+            return html_output, pd.DataFrame() # Return 2 items
+            
+        # --- 3. Format the Results ---
+        results_df = pd.DataFrame(indicator_results)
+        
+        reject, p_adjusted, _, _ = multipletests(results_df['p_value'], alpha=0.05, method='fdr_bh')
+        results_df['p_adj'] = p_adjusted
+        
+        significant_indicators = results_df[(results_df['p_adj'] < 0.05) & (results_df['Indicator Score'] > 0.25)].copy()
+
+        if significant_indicators.empty:
+            html_output = html.Div([html.H4("Indicator ASV Analysis"), html.P("No significant indicator ASVs were found for any group.")])
+            return html_output, pd.DataFrame()
+
+        significant_indicators.sort_values('Indicator Score', ascending=False, inplace=True)
+        
+        taxa = ps1_object['tax']
+        # Merge the taxonomy data. The 'ASV' column is the key.
+        significant_indicators_with_taxa = significant_indicators.merge(taxa, left_on='ASV', right_index=True)
+        
+        # --- 4. Create the HTML Table for Display ---
+        
+        # First, create a temporary dataframe for display purposes
+        df_for_display = significant_indicators_with_taxa.copy()
+        df_for_display.fillna('', inplace=True)
+        df_for_display['p_adj'] = df_for_display['p_adj'].astype(float).map('{:.4f}'.format)
+        df_for_display['Indicator Score'] = df_for_display['Indicator Score'].astype(float).map('{:.3f}'.format)
+        
+        # Choose the columns to show in the UI table
+        display_columns = ['Associated Group', 'Indicator Score', 'p_adj', 'Phylum', 'Order', 'Family', 'Genus', 'Species']
+        final_df = df_for_display[display_columns].rename(columns={'p_adj': 'Adjusted p-value'})
+        
+        table_header = [html.Thead(html.Tr([html.Th(col) for col in final_df.columns]))]
+        table_body = [html.Tbody([html.Tr([html.Td(final_df.iloc[i][col]) for col in final_df.columns]) for i in range(min(len(final_df), 25))])]
+        
+        html_output = html.Div([
+            html.H4("Indicator ASV Analysis (Top 25)"),
+            html.P("The following ASVs are significant indicators (biomarkers) for a specific group:"),
+            html.Table(table_header + table_body, style={'marginLeft': 'auto', 'marginRight': 'auto', 'marginTop': '20px'})
+        ])
+        
+        # Return both the HTML table and the raw dataframe of significant indicators
+        return html_output, significant_indicators_with_taxa
+        
+    except Exception as e:
+        logger.error(f"Indicator Species Analysis failed: {e}", exc_info=True)
+        error_html = html.P("Error during Indicator Species Analysis.")
+        # Return 2 items on error as well
+        return error_html, pd.DataFrame()
 # Callbacks
+@app.callback(
+    Output('output-r1-filenames', 'children'),
+    Output('output-r2-filenames', 'children'),
+    Output('output-metadata-filename', 'children'),
+    Input('list-files-button', 'n_clicks'),
+    State('data-folder-path', 'value'),
+    prevent_initial_call=True
+)
+def list_files_in_folder(n_clicks, folder_path):
+    """
+    Reads a folder path, lists the files, categorizes them,
+    and displays them in the UI.
+    """
+    logger.info(f"Button clicked to list files in folder: '{folder_path}'")
+
+    if not folder_path or not os.path.isdir(folder_path):
+        error_message = html.Div(
+            f"Error: Folder not found or path is invalid. Please check the path: '{folder_path}'",
+            style={'color': 'red', 'fontWeight': 'bold'}
+        )
+        return error_message, None, None
+
+    try:
+        all_files = os.listdir(folder_path)
+    except Exception as e:
+        error_message = html.Div(f"An error occurred while accessing the folder: {e}", style={'color': 'red'})
+        return error_message, None, None
+
+    r1_files = sorted([f for f in all_files if '_R1' in f.upper() and (f.lower().endswith('.fastq') or f.lower().endswith('.fastq.gz'))])
+    r2_files = sorted([f for f in all_files if '_R2' in f.upper() and (f.lower().endswith('.fastq') or f.lower().endswith('.fastq.gz'))])
+    metadata_files = sorted([f for f in all_files if f.lower().endswith(('.csv', '.tsv', '.txt'))])
+
+    def create_file_list_component(title, files):
+        if not files:
+            return html.P(f"No {title} found in this folder.")
+        
+        return html.Div([
+            html.H4(f"{title} Found:"),
+            html.Ul([html.Li(file) for file in files], style={'listStyleType': 'none', 'paddingLeft': '20px'})
+        ])
+
+    r1_output = create_file_list_component("R1 FASTQ Files", r1_files)
+    r2_output = create_file_list_component("R2 FASTQ Files", r2_files)
+    metadata_output = create_file_list_component("Metadata/Text Files", metadata_files)
+
+    return r1_output, r2_output, metadata_output
+
+@app.callback(
+    Output('silva-status-output', 'children'),
+    Output('silva-status-output', 'style'),
+    Input('upload-silva', 'filename'),
+    Input('list-files-button', 'n_clicks'),
+    State('data-folder-path', 'value'),
+    prevent_initial_call=True
+)
+def update_silva_status(uploaded_filename, n_clicks, folder_path):
+    """
+    Provides feedback on the status of the SILVA database file.
+    Checks for both direct uploads and a file named 'silva.fasta' in the data folder.
+    """
+    ctx = dash.callback_context
+    triggered_id = ctx.triggered_id
+
+    base_style = {'marginTop': '5px', 'padding': '8px', 'borderRadius': '3px', 'fontWeight': 'bold'}
+
+    # Scenario 1: User uploaded a file directly
+    if triggered_id == 'upload-silva' and uploaded_filename:
+        logger.info(f"SILVA file uploaded: {uploaded_filename}")
+        success_style = base_style | {'backgroundColor': '#e6ffed', 'color': '#2d6a4f'}
+        return f"✓ Successfully uploaded: {uploaded_filename}", success_style
+
+    # Scenario 2: User clicked the "List Files" button
+    if triggered_id == 'list-files-button':
+        # First, ensure the folder path is valid
+        if not folder_path or not os.path.isdir(folder_path):
+            warning_style = base_style | {'backgroundColor': '#fff3cd', 'color': '#856404'}
+            return "ⓘ Provide a valid data folder path to check for 'silva.fasta'.", warning_style
+
+        # Check for 'silva.fasta' in the specified folder
+        expected_silva_path = os.path.join(folder_path, 'silva.fasta')
+        if os.path.exists(expected_silva_path):
+            logger.info(f"Found 'silva.fasta' in folder: {folder_path}")
+            success_style = base_style | {'backgroundColor': '#e6ffed', 'color': '#2d6a4f'}
+            return f"✓ Found 'silva.fasta' in {folder_path}", success_style
+        else:
+            logger.warning(f"'silva.fasta' not found in folder: {folder_path}")
+            info_style = base_style | {'backgroundColor': '#e2e3e5', 'color': '#383d41'}
+            return "ⓘ Note: 'silva.fasta' was not found in the data folder. Please upload it if needed for analysis.", info_style
+
+    return dash.no_update, dash.no_update
+
 @app.callback(
     [Output('manual-params', 'style'),
      Output('ai-suggested-params', 'style')],
@@ -733,38 +1629,17 @@ def toggle_param_inputs(param_mode):
     except Exception as e:
         logger.error(f"Error in toggle_param_inputs: {e}")
         return [{'display': 'block'}, {'display': 'none'}]
+        
 
-@app.callback([
-    Output('upload-fastq-r1', 'contents'),
-    Output('upload-fastq-r1', 'filename'),
-    Output('upload-fastq-r2', 'contents'),
-    Output('upload-fastq-r2', 'filename'),
-    Output('upload-metadata', 'contents'),
-    Output('background-info', 'value')],
-    [Input('load-sample-data', 'n_clicks')]
+@app.callback(
+    Output('data-folder-path', 'value'),
+    Input('load-sample-data', 'n_clicks')
 )
 def load_sample_data(n_clicks):
-    """
-    Load sample data into upload fields when triggered.
+    if n_clicks > 0:
+        return ""
+    return dash.no_update    
     
-    Args:
-        n_clicks: Number of clicks on the load sample data button
-    
-    Returns:
-        list: Sample data contents, filenames, metadata, and background info
-    """
-    try:
-        if n_clicks == 0:
-            return [None], [], [None], [], None, None
-        r1_contents = [f"data:text/plain;base64,{base64.b64encode(f.encode()).decode()}" for f in sample_fastq_r1]
-        r2_contents = [f"data:text/plain;base64,{base64.b64encode(f.encode()).decode()}" for f in sample_fastq_r2]
-        metadata_content = f"data:text/csv;base64,{base64.b64encode(sample_metadata.encode()).decode()}"
-        logger.info("Sample data loaded successfully")
-        return [r1_contents, sample_filenames[:3], r2_contents, sample_filenames[3:], metadata_content, sample_background]
-    except Exception as e:
-        logger.error(f"Error loading sample data: {e}")
-        return [None], [], [None], [], None, None
-
 @app.callback(
     Output('ai-clarification-questions', 'children'),
     [Input('background-info', 'value')]
@@ -816,72 +1691,42 @@ def update_clarification_questions(background):
      Output('ai-pval-threshold', 'value'),
      Output('ai-contrib-threshold', 'options'),
      Output('ai-contrib-threshold', 'value')],
-    [Input('upload-fastq-r1', 'contents'),
-     Input('upload-fastq-r2', 'contents'),
-     Input('upload-metadata', 'contents')]
+    [Input('suggest-ai-params-button', 'n_clicks')],
+    [State('data-folder-path', 'value')]
 )
-def update_ai_suggested_params(r1_contents, r2_contents, metadata_content):
-    """
-    Update AI-suggested parameters based on uploaded files.
-    
-    Args:
-        r1_contents: List of forward FASTQ contents
-        r2_contents: List of reverse FASTQ contents
-        metadata_content: Metadata CSV content
-    
-    Returns:
-        list: Options and values for AI-suggested parameters
-    """
+def update_ai_suggested_params(n_clicks, data_folder_path):
+    if n_clicks is None or n_clicks == 0:
+        return dash.no_update
+
     try:
-        if not r1_contents or not r2_contents or not metadata_content:
-            logger.info("No input files, returning default AI parameters")
-            return [
-                [{'label': '12', 'value': 12}], 12,
-                [{'label': '12', 'value': 12}], 12,
-                [{'label': '[2,2]', 'value': '[2,2]'}], '[2,2]',
-                [{'label': '5', 'value': 5}], 5,
-                [{'label': 'Treatment', 'value': 'Treatment'}], 'Treatment',
-                [{'label': '20,50,100', 'value': '20,50,100'}], '20,50,100',
-                [{'label': '0.005', 'value': 0.005}], 0.005,
-                [{'label': '0.65', 'value': 0.65}], 0.65
-            ]
-        
-        output_dir = './temp'
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        fnFs = []
-        fnRs = []
-        sample_names = []
-        r1_filenames = [f"sample_r1_{i}.fastq" for i in range(len(r1_contents))]
-        r2_filenames = [f"sample_r2_{i}.fastq" for i in range(len(r2_contents))]
-        
-        for content, fname in zip(r1_contents, r1_filenames):
-            path = os.path.join(output_dir, fname)
-            with open(path, 'wb') as f:
-                f.write(base64.b64decode(content.split(',')[1]))
-            fnFs.append(path)
-            sample_names.add(fname.split('_')[0])
-        for content, fname in zip(r2_contents, r2_filenames):
-            path = os.path.join(output_dir, fname)
-            with open(path, 'wb') as f:
-                f.write(base64.b64decode(content.split(',')[1]))
-            fnRs.append(path)
-        
-        metadata_content = base64.b64decode(metadata_content.split(',')[1]).decode('utf-8')
-        metadata = pd.read_csv(StringIO(metadata_content))
+        if not data_folder_path or not os.path.isdir(data_folder_path):
+            logger.warning("AI suggestions require a valid data folder path.")
+            return [dash.no_update] * 16 # 16 is the number of outputs
+
+        logger.info(f"Generating AI suggestions from folder: {data_folder_path}")
+        all_files = os.listdir(data_folder_path)
+        fnFs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R1' in f])
+        fnRs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R2' in f])
+        meta_file_path = sorted([os.path.join(data_folder_path, f) for f in all_files if f.lower().endswith('.csv')])
+
+        if not fnFs or not fnRs or not meta_file_path:
+            logger.warning("Could not find R1, R2, and metadata files in folder to generate AI suggestions.")
+            return [dash.no_update] * 16
+
+        metadata = pd.read_csv(meta_file_path[0])
+
         
         quality_params = ai_analyze_quality_profiles(fnFs, fnRs) if ai_available else None
-        trunc_len_f_opts = [{'label': str(x), 'value': x} for x in [200, 250, 280, 300]] if not quality_params else [{'label': str(quality_params['trunc_len_f']), 'value': quality_params['trunc_len_f']}]
-        trunc_len_r_opts = [{'label': str(x), 'value': x} for x in [180, 200, 220, 240]] if not quality_params else [{'label': str(quality_params['trunc_len_r']), 'value': quality_params['trunc_len_r']}]
-        max_ee_opts = [{'label': str(x), 'value': str(x)} for x in ['[2,2]', '[3,3]', '[2,5]', '[5,2]']] if not quality_params else [{'label': str(quality_params['max_ee']), 'value': str(quality_params['max_ee'])}]
         trunc_len_f_val = quality_params['trunc_len_f'] if quality_params else 280
         trunc_len_r_val = quality_params['trunc_len_r'] if quality_params else 220
         max_ee_val = str(quality_params['max_ee']) if quality_params else '[2,2]'
         
-        treatment = ai_analyze_metadata(metadata) if ai_available else None
-        treatment_opts = [{'label': col, 'value': col} for col in metadata.columns] if not treatment else [{'label': treatment, 'value': treatment}]
-        treatment_val = treatment if treatment else metadata.columns[0]
+        treatment_val = ai_analyze_metadata(metadata) if ai_available else metadata.columns[0]
         
+        trunc_len_f_opts = [{'label': str(trunc_len_f_val), 'value': trunc_len_f_val}]
+        trunc_len_r_opts = [{'label': str(trunc_len_r_val), 'value': trunc_len_r_val}]
+        max_ee_opts = [{'label': max_ee_val, 'value': max_ee_val}]
+        treatment_opts = [{'label': treatment_val, 'value': treatment_val}]
         prev_opts = [{'label': str(x), 'value': x} for x in [0, 2, 5, 10]]
         top_asvs_opts = [{'label': str(x), 'value': str(x)} for x in ['20,50,100', '10,50,100', '50,100,200']]
         pval_opts = [{'label': str(x), 'value': x} for x in [0.001, 0.005, 0.01, 0.05]]
@@ -901,6 +1746,7 @@ def update_ai_suggested_params(r1_contents, r2_contents, metadata_content):
     
     except Exception as e:
         logger.error(f"Error updating AI-suggested params: {e}")
+        return [dash.no_update] * 16
         return [
             [{'label': '12', 'value': 12}], 12,
             [{'label': '12', 'value': 12}], 12,
@@ -911,226 +1757,262 @@ def update_ai_suggested_params(r1_contents, r2_contents, metadata_content):
             [{'label': '0.005', 'value': 0.005}], 0.005,
             [{'label': '0.65', 'value': 0.65}], 0.65
         ]
-
+@app.callback(
+    Output('preprocessing-params-div', 'style'),
+    Input('analysis-mode', 'value')
+)
+def toggle_preprocessing_params(analysis_mode):
+    """
+    This function listens for a click on the 'Analysis Starting Point' radio button.
+    If the user selects 'asv' mode, it hides the pre-processing parameters.
+    If the user selects 'fastq' mode, it shows them again.
+    """
+    if analysis_mode == 'fastq':
+        # Show the div by returning a normal style dictionary
+        return {'display': 'block'}
+    else:
+        # Hide the div by setting its display style to 'none'
+        return {'display': 'none'}
 @app.callback(
     [Output('seq-depth-plot', 'figure'),
      Output('alpha-diversity-plot', 'figure'),
      Output('beta-diversity-plot', 'figure'),
      Output('pca-plot', 'figure'),
+     Output('nmds-plot', 'figure'),
      Output('pcoa-plot', 'figure'),
+     Output('permanova-results', 'children'),
      Output('abundance-plot', 'figure'),
+     Output('abundance-order-plot', 'figure'),
+     Output('differential-abundance-results', 'children'),
+     Output('indicator-species-results', 'children'),
      Output('output-files', 'children'),
      Output('phylogenetic-tree', 'children'),
      Output('ai-interpretations', 'children')],
     [Input('run-analysis', 'n_clicks')],
-    [State('upload-fastq-r1', 'contents'),
-     State('upload-fastq-r1', 'filename'),
-     State('upload-fastq-r2', 'contents'),
-     State('upload-fastq-r2', 'filename'),
-     State('upload-metadata', 'contents'),
-     State('upload-silva', 'contents'),
+    [State('analysis-mode', 'value'),
+     State('data-folder-path', 'value'),
      State('output-dir', 'value'),
-     State('param-mode', 'value'),
      State('trunc-len-f', 'value'),
      State('trunc-len-r', 'value'),
      State('max-ee', 'value'),
-     State('prev-threshold', 'value'),
      State('treatment-group', 'value'),
+     State('subset-groups-dropdown', 'value'),
      State('top-asvs', 'value'),
-     State('pval-threshold', 'value'),
-     State('contrib-threshold', 'value'),
-     State('ai-trunc-len-f', 'value'),
-     State('ai-trunc-len-r', 'value'),
-     State('ai-max-ee', 'value'),
-     State('ai-prev-threshold', 'value'),
-     State('ai-treatment-group', 'value'),
-     State('ai-top-asvs', 'value'),
-     State('ai-pval-threshold', 'value'),
-     State('ai-contrib-threshold', 'value'),
-     State('background-info', 'value')]
+     State('background-info', 'value'),
+     # Adding silva_content back in for completeness
+     State('upload-silva', 'contents')], 
+    prevent_initial_call=True
 )
-def run_analysis(n_clicks, r1_contents, r1_filenames, r2_contents, r2_filenames, metadata_content, silva_content, output_dir, param_mode, trunc_len_f, trunc_len_r, max_ee, prev_threshold, treatment, top_asvs, pval_threshold, contrib_threshold, ai_trunc_len_f, ai_trunc_len_r, ai_max_ee, ai_prev_threshold, ai_treatment, ai_top_asvs, ai_pval_threshold, ai_contrib_threshold, background):
-    """
-    Run the microbiome analysis pipeline and generate plots.
-    
-    Args:
-        n_clicks: Number of clicks on run-analysis button
-        r1_contents, r2_contents: FASTQ file contents
-        r1_filenames, r2_filenames: FASTQ filenames
-        metadata_content: Metadata CSV content
-        silva_content: SILVA database content
-        output_dir: Output directory path
-        param_mode: Parameter mode selection
-        trunc_len_f, trunc_len_r: Truncation lengths
-        max_ee: Maximum expected errors
-        prev_threshold: Prevalence threshold
-        treatment: Treatment column name
-        top_asvs: Top ASVs for PCA
-        pval_threshold: P-value threshold
-        contrib_threshold: Contribution threshold
-        ai_params: AI-suggested parameters
-        background: Background information
-    
-    Returns:
-        list: Plotly figures, output file paths, tree image, interpretations
-    """
+def run_analysis(n_clicks, analysis_mode, data_folder_path, output_dir,
+                 trunc_len_f, trunc_len_r, max_ee_str, treatment, subset_groups, top_asvs, background, silva_content):
     try:
-        if n_clicks == 0 or n_clicks is None:
-            logger.info("No analysis triggered")
-            return [
-                px.scatter(), px.scatter(), px.scatter(),
-                px.scatter(), px.scatter(), px.scatter(),
-                "No analysis run yet.",
-                html.Img(),
-                "No interpretations available."
-            ]
-        
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        
-        # Use sample data if filenames indicate sample data
-        if r1_filenames and any('Sample' in fname for fname in r1_filenames):
-            seqtab = sample_seqtab
-            taxa = sample_taxa
-            metadata = pd.read_csv(StringIO(sample_metadata), index_col=0)
-            logger.info("Using sample data for analysis")
-        else:
-            if not r1_contents or not r2_contents or not metadata_content:
-                raise ValueError("Missing required input files")
-            fnFs = []
-            fnRs = []
-            sample_names = set()
-            for content, fname in zip(r1_contents, r1_filenames):
-                path = os.path.join(output_dir, fname)
-                with open(path, 'wb') as f:
-                    f.write(base64.b64decode(content.split(',')[1]))
-                fnFs.append(path)
-                sample_names.add(fname.split('_')[0])
-            for content, fname in zip(r2_contents, r2_filenames):
-                path = os.path.join(output_dir, fname)
-                with open(path, 'wb') as f:
-                    f.write(base64.b64decode(content.split(',')[1]))
-                fnRs.append(path)
-            
-            unzip_files([f for f in fnFs + fnRs if f.endswith('.zip')], output_dir)
-            fnFs = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if '_R1' in f and (f.endswith('.fastq') or f.endswith('.fastq.gz'))]
-            fnRs = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if '_R2' in f and (f.endswith('.fastq') or f.endswith('.fastq.gz'))]
-            
-            metadata_content = base64.b64decode(metadata_content.split(',')[1]).decode('utf-8')
-            metadata = pd.read_csv(StringIO(metadata_content), index_col=0)
-            
-            if param_mode == 'ai_automatic':
-                quality_params = ai_analyze_quality_profiles(fnFs, fnRs) if ai_available else None
-                trunc_len_f = quality_params['trunc_len_f'] if quality_params else 280
-                trunc_len_r = quality_params['trunc_len_r'] if quality_params else 220
-                max_ee = quality_params['max_ee'] if quality_params else [2, 2]
-                treatment = ai_analyze_metadata(metadata) or metadata.columns[0] if ai_available else metadata.columns[0]
-            elif param_mode == 'ai_suggested':
-                trunc_len_f = ai_trunc_len_f or trunc_len_f
-                trunc_len_r = ai_trunc_len_r or trunc_len_r
-                max_ee = [float(x.strip()) for x in ai_max_ee.strip('[]').split(',') if x.strip()] if ai_max_ee else [float(x.strip()) for x in max_ee.split(',') if x.strip()]
-                prev_threshold = ai_prev_threshold or prev_threshold
-                treatment = ai_treatment or treatment
-                top_asvs = ai_top_asvs or top_asvs
-                pval_threshold = ai_pval_threshold or pval_threshold
-                contrib_threshold = ai_contrib_threshold or contrib_threshold
-            else:
-                max_ee = [float(x.strip()) for x in max_ee.split(',') if x.strip()]
-            
-            filtFs, filtRs = filter_and_trim(fnFs, fnRs, list(sample_names), output_dir, trunc_len_f, trunc_len_r, max_ee)
-            if not filtFs or not filtRs:
-                raise ValueError("Failed to filter and trim sequences")
-            seqtab, taxa = process_sequences(filtFs, filtRs, list(sample_names), silva_content, output_dir)
-            if seqtab is None or taxa is None:
-                raise ValueError("Failed to process sequences")
-        
-        if param_mode == 'ai_automatic':
-            prev_threshold = ai_analyze_prevalence(seqtab) or 0 if ai_available else 0
-        
-        ps1 = create_phyloseq_object(seqtab, taxa, metadata)
-        if not ps1:
-            raise ValueError("Failed to create phyloseq object")
-        prev = seqtab.sum(axis=0)
-        keep_taxa = prev[prev >= prev_threshold].index
-        ps1['asv'] = ps1['asv'].loc[keep_taxa]
-        ps1['tax'] = ps1['tax'].loc[keep_taxa]
-        
-        ps1_meta = calculate_alpha_diversity(ps1, treatment)
-        if ps1_meta is None:
-            raise ValueError("Failed to calculate alpha diversity")
-        asv_rel, meta_rel = calculate_beta_diversity(ps1)
-        if asv_rel is None or meta_rel is None:
-            raise ValueError("Failed to calculate beta diversity")
-        
-        top_asvs_list = [int(x.strip()) for x in top_asvs.split(',') if x.strip()]
-        pca_result, explained_variance = perform_pca(asv_rel, top_asvs_list[-1])
-        if pca_result is None:
-            raise ValueError("Failed to perform PCA")
-        global_data['pca_result'] = pca_result
-        global_data['explained_variance'] = explained_variance
-        
-        if param_mode == 'ai_automatic':
-            pca_pcoa_params = ai_analyze_pca_pcoa(asv_rel, explained_variance) if ai_available else None
-            if pca_pcoa_params:
-                top_asvs = pca_pcoa_params['top_asvs']
-                pval_threshold = pca_pcoa_params['pval_threshold']
-                contrib_threshold = pca_pcoa_params['contrib_threshold']
-            top_asvs_list = [int(x.strip()) for x in top_asvs.split(',') if x.strip()]
-            pca_result, explained_variance = perform_pca(asv_rel, top_asvs_list[-1])
-            global_data['pca_result'] = pca_result
-            global_data['explained_variance'] = explained_variance
-        
-        pcoa_scores, dm = perform_pcoa(asv_rel, meta_rel, treatment, pval_threshold, contrib_threshold)
-        if pcoa_scores is None:
-            raise ValueError("Failed to perform PCoA")
-        ps1_melt = asv_rel.reset_index().melt(id_vars=['index'], var_name='ASV', value_name='Abundance')
-        ps1_melt = ps1_melt.merge(meta_rel[[treatment]], left_on='index', right_index=True)
-        ps1_melt['Abundance'] *= 100
-        tree_img = plot_phylogenetic_tree(seqtab)
-        if not tree_img:
-            raise ValueError("Failed to generate phylogenetic tree")
-        
-        interpretations = ai_interpret_results(seqtab, ps1_meta, pcoa_scores, (pca_result, explained_variance), ps1_melt, tree_img, background)
-        if not interpretations:
-            interpretations = "No interpretations available."
-        global_data['ai_interpretations'] = interpretations
-        
-        seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
-        alpha_fig = px.violin(ps1_meta, x=treatment, y='Shannon', box=True, points='all', title="Shannon Diversity")
-        beta_fig = px.scatter(pcoa_scores, x=0, y=1, color=treatment, title="PCoA Plot")
-        pca_fig = px.scatter(x=pca_result[:,0], y=pca_result[:,1], title="PCA Plot")
-        abundance_fig = px.histogram(ps1_melt, x='index', y='Abundance', color='ASV', facet_col=treatment, title="Abundance by Treatment")
-        
-        output_files = [
-            html.P(f"ASV Table: {os.path.join(output_dir, 'microbiomeai_16s_asv.csv')}"),
-            html.P(f"Taxonomy Table: {os.path.join(output_dir, 'microbiomeai_taxonomy.csv')}")
-        ]
-        
-        logger.info("Analysis completed successfully")
-        return [
-            seq_depth_fig,
-            alpha_fig,
-            beta_fig,
-            pca_fig,
-            output_files,
-            html.Img(src=tree_img),
-            dcc.Markdown(interpretations)
-        ]
-    
-    except Exception as e:
-        logger.error(f"Error in run_analysis: {e}")
-        return [
-            px.scatter(title=f"Error: {str(e)}"),
-            px.scatter(title=f"Error: {str(e)}"),
-            px.scatter(title=f"Error: {str(e)}"),
-            px.scatter(title=f"Error: {str(e)}"),
-            px.scatter(title=f"Error: {str(e)}"),
-            px.scatter(title=f"Error: {str(e)}"),
-            f"Error: {str(e)}",
-            html.P(f"Error: {str(e)}"),
-            f"Error: {str(e)}"
-        ]
+        if n_clicks == 0:
+            return [dash.no_update] * 13
 
+        os.makedirs(output_dir, exist_ok=True)
+
+        # --- SECTION 1: DATA LOADING ---
+        if not data_folder_path:
+            logger.warning("No data folder path provided.")
+            empty_fig = go.Figure(layout_title_text="Please provide a data folder path.")
+            return [empty_fig] * 9 + [html.P("Provide data folder path.")] * 4
+
+        all_files = os.listdir(data_folder_path)
+        meta_files = sorted([f for f in all_files if f.lower().endswith(('.csv', '.tsv'))])
+        if not meta_files:
+            raise ValueError("Could not find a metadata file in the data folder.")
+        
+        metadata_path = os.path.join(data_folder_path, meta_files[0])
+        metadata_df = pd.read_csv(metadata_path)
+        sample_id_col = metadata_df.columns[0]
+        metadata_df[sample_id_col] = metadata_df[sample_id_col].astype(str)
+        metadata_df.set_index(sample_id_col, inplace=True)
+
+        if analysis_mode == 'fastq':
+            logger.info("Mode: Starting from raw FASTQ files.")
+            fnFs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R1' in f.upper()])
+            sample_names = [os.path.basename(f).split('_')[0] for f in fnFs]
+            metadata = metadata_df.loc[sample_names].copy()
+            fnRs = sorted([os.path.join(data_folder_path, f) for f in all_files if '_R2' in f.upper()])
+#            max_ee = [float(x.strip()) for x in str(max_ee_str).split(',') if x.strip()]
+            filtFs, filtRs = filter_and_trim_parallel(fnFs, fnRs, sample_names, output_dir, trunc_len_f, trunc_len_r, max_ee_str)
+            seqtab = denoise_and_create_asv_table_vsearch(filtFs, filtRs, sample_names, output_dir)
+            if seqtab is None or seqtab.empty: raise ValueError("vsearch failed to create an ASV table.")
+
+            asv_fasta_path = os.path.join(output_dir, 'asvs.fa')
+
+            # --- START: CORRECTED SILVA PATH LOGIC ---
+            silva_path = None
+            
+            # 1. First, check if a file was explicitly uploaded. This takes priority.
+            if silva_content:
+                logger.info("Using uploaded SILVA file for taxonomy assignment.")
+                _, content_string = silva_content.split(',')
+                decoded = base64.b64decode(content_string)
+                silva_path = os.path.join(output_dir, 'uploaded_silva.fasta')
+                with open(silva_path, 'wb') as f:
+                    f.write(decoded)
+            
+            # 2. If no file was uploaded, check for 'silva.fasta' in the data folder.
+            else:
+                expected_silva_path = os.path.join(data_folder_path, 'silva.fasta')
+                if os.path.exists(expected_silva_path):
+                    logger.info("Found 'silva.fasta' in the project data folder. Using it for taxonomy.")
+                    silva_path = expected_silva_path
+                else:
+                    logger.warning("No SILVA file was uploaded AND 'silva.fasta' was not found in the data folder.")
+            taxa = assign_taxonomy(list(seqtab.columns), asv_fasta_path, silva_path, output_dir)
+        else:
+            logger.info("Mode: Starting from Processed ASV and Taxonomy Tables.")
+            asv_path = os.path.join(output_dir, 'microbiome_ai_16s_asv.csv')
+            taxa_path = os.path.join(output_dir, 'microbiome_ai_taxonomy.csv')
+            if not os.path.exists(asv_path) or not os.path.exists(taxa_path):
+                raise FileNotFoundError(f"Processed files not found. Run in 'FASTQ files' mode first.")
+            seqtab = pd.read_csv(asv_path, sep='\t', index_col=0)
+            taxa = pd.read_csv(taxa_path, index_col=0)
+            seqtab.index = seqtab.index.astype(str)
+            metadata_df.index = metadata_df.index.astype(str)
+            metadata = metadata_df.loc[seqtab.index].copy()
+            logger.info(f"Loaded ASV table {seqtab.shape} and Taxonomy table {taxa.shape}.")
+        
+        # --- SECTION 2: SHARED ANALYSIS PIPELINE ---
+        
+        ps1_full = create_phyloseq_object(seqtab, taxa, metadata)
+        if not ps1_full: raise ValueError("Failed to create phyloseq object.")
+        
+        global_data['ps1'] = ps1_full
+
+        ps1 = ps1_full
+        if subset_groups:
+            logger.info(f"Subsetting data to groups: {subset_groups}")
+            meta_subset = ps1_full['meta'][ps1_full['meta'][treatment].isin(subset_groups)]
+            samples_to_keep = meta_subset.index
+            ps1 = {'asv': ps1_full['asv'][samples_to_keep], 'tax': ps1_full['tax'], 'meta': meta_subset}
+
+        # --- Alpha Diversity ---
+        ps1_meta = calculate_alpha_diversity(ps1, treatment)
+        alpha_fig = px.violin(ps1_meta, x=treatment, y='Shannon', box=True, points='all', title=f"Shannon Diversity by {treatment}",
+                      width=800, height=600)
+        pairwise_stats_df = perform_pairwise_alpha_tests(ps1_meta, treatment)
+        if not pairwise_stats_df.empty:
+            alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treatment, pairwise_stats_df)
+        
+        # --- Beta Diversity & Ordination ---
+        asv_rel, meta_rel = calculate_beta_diversity(ps1)
+        pcoa_scores, dm, pcoa_variance = perform_pcoa(asv_rel, meta_rel, treatment)
+        permanova_output = run_permanova(dm, meta_rel, treatment)
+        
+        # --- NMDS ---
+        nmds_scores, nmds_stress = perform_nmds(dm)
+        if nmds_scores is not None:
+            nmds_df = nmds_scores.join(ps1['meta'][[treatment]])
+            nmds_fig = px.scatter(nmds_df, x='NMDS1', y='NMDS2', color=treatment, title=f"NMDS Plot (Stress: {nmds_stress:.4f})", hover_name=nmds_df.index)
+        else:
+            nmds_fig = go.Figure(layout_title_text="NMDS could not be calculated.")
+        
+        # --- PCA ---
+        top_asvs_list = [int(x.strip()) for x in str(top_asvs).split(',') if x.strip()]
+        pca_result, explained_variance = perform_pca(ps1['asv'], top_asvs_list[-1])
+        
+        # --- Generate Final Plots and Outputs ---
+        seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
+        pcoa_fig = px.scatter(
+        pcoa_scores, 
+        x='PC1', 
+        y='PC2', 
+        color=treatment, 
+        title="2D PCoA Plot (Bray-Curtis)", 
+        hover_name=pcoa_scores.index,
+        labels={
+            "PC1": f"PC1 ({pcoa_variance['PC1']*100:.2f}%)", # Format as percentage
+            "PC2": f"PC2 ({pcoa_variance['PC2']*100:.2f}%)"
+        },
+        width=800, height=600
+    )
+        beta_fig = pcoa_fig
+        pca_df = pd.DataFrame(pca_result, columns=['PC1', 'PC2'], index=ps1['meta'].index).join(ps1['meta'][treatment])
+        pca_fig = px.scatter(
+       pca_df, 
+       x='PC1', 
+       y='PC2', 
+       color=treatment, 
+       title=f"2D PCA Plot (Top {top_asvs_list[-1]} ASVs)", 
+       hover_name=pca_df.index,
+       labels={
+           "PC1": f"PC1 ({explained_variance[0]*100:.2f}%)", # Format as percentage
+           "PC2": f"PC2 ({explained_variance[1]*100:.2f}%)"
+       },
+       width=800, height=600
+   )
+
+        # --- Abundance Plot by Phylum (FINAL CORRECTED LOGIC) ---
+        asv_absolute_phylum = ps1['asv']
+        melted_df_phylum = asv_absolute_phylum.stack().reset_index()
+        melted_df_phylum.columns = ['ASV', 'SampleID', 'Abundance']
+        melted_df_phylum = melted_df_phylum.merge(ps1['tax']['Phylum'], on='ASV')
+        melted_df_phylum = melted_df_phylum.merge(ps1['meta'][[treatment]], left_on='SampleID', right_index=True)
+        group_phylum_sums = melted_df_phylum.groupby([treatment, 'Phylum'])['Abundance'].sum().reset_index()
+        total_sum_per_group = group_phylum_sums.groupby(treatment)['Abundance'].transform('sum')
+        group_phylum_sums['RelativeAbundance'] = group_phylum_sums.apply(lambda row: row['Abundance'] / total_sum_per_group[row.name] if total_sum_per_group[row.name] > 0 else 0, axis=1)
+        abundance_fig = px.bar(group_phylum_sums, x=treatment, y='RelativeAbundance', color='Phylum', title="Mean Relative Abundance by Phylum", height=600, width=1000)
+        abundance_fig.update_layout(yaxis_tickformat='.0%', yaxis_title="Mean Relative Abundance", legend=dict(orientation="h", yanchor="bottom", y=-0.4, xanchor="center", x=0.5))
+        abundance_fig.update_xaxes(tickangle=45)
+
+        # --- Abundance Plot by Order ---
+        abundance_order_fig = plot_abundance_by_order(ps1, treatment)
+        
+        # --- Differential Abundance Analysis ---
+        diff_abundance_output = run_differential_abundance(ps1, treatment)
+        indicator_species_output, indicator_raw_df = run_indicator_species(ps1, treatment)
+        # --- Other Outputs ---
+        tree_img = plot_phylogenetic_tree(seqtab, taxa, indicator_raw_df)
+        asv_melted_for_ai = ps1['asv'].reset_index().rename(columns={'index': 'ASV'})
+        ps1_melt_for_ai = asv_melted_for_ai.melt(id_vars=['ASV'], var_name='SampleID', value_name='Abundance')
+        # Placeholder for AI interpretations
+        interpretations = "AI interpretations can be generated here." 
+        
+        output_files_children = [html.P(f"ASV Table: {os.path.join(output_dir, 'microbiome_ai_16s_asv.csv')}"),
+                                 html.P(f"Taxonomy Table: {os.path.join(output_dir, 'microbiome_ai_taxonomy.csv')}")]
+        phylogenetic_tree_children = html.Img(src=tree_img) if tree_img else html.P("Tree could not be generated.")
+
+        logger.info("Analysis completed successfully")
+        return [seq_depth_fig, alpha_fig, beta_fig, pca_fig, nmds_fig, pcoa_fig, permanova_output, abundance_fig, abundance_order_fig,
+                diff_abundance_output, indicator_species_output, output_files_children, phylogenetic_tree_children, dcc.Markdown(interpretations)]
+
+    except Exception as e:
+        logger.error(f"Error in run_analysis: {e}", exc_info=True)
+        error_fig = go.Figure(layout_title_text=f"Error: {e}")
+        error_message = html.Div([html.H4("Analysis Failed"), html.P(f"Details: {e}")])
+        return [error_fig, error_fig, error_fig, error_fig, error_fig, error_fig, error_message, error_fig, error_fig,
+                error_message, error_message, error_message, error_message, error_message] 
+
+@app.callback(
+    Output('subset-groups-dropdown', 'options'),
+    Input('run-analysis', 'n_clicks'), # Trigger after the button is clicked
+    State('treatment-group', 'value')
+    # We add prevent_initial_call=True if it's not there,
+    # but the main fix is checking for the data's existence.
+)
+def update_subset_dropdown(n_clicks, treatment_col):
+    # This check is now more robust. It won't run if data isn't ready.
+    if n_clicks is None or n_clicks == 0 or 'ps1' not in global_data or global_data['ps1'] is None:
+        # Return an empty list of options if data isn't available yet
+        return []
+    
+    try:
+        # This part of the code is fine and will only run when data is available
+        all_groups = global_data['ps1']['meta'][treatment_col].unique()
+        options = [{'label': group, 'value': group} for group in sorted(all_groups)]
+        return options
+    except KeyError:
+        # This is a fallback in case the treatment column name is wrong
+        logger.warning(f"Column '{treatment_col}' not found in metadata for dropdown.")
+        return []
+    
+    # Get the full list of groups from the complete dataset
+    all_groups = global_data['ps1']['meta'][treatment_col].unique()
+    options = [{'label': group, 'value': group} for group in sorted(all_groups)]
+    return options
 @app.callback(
     Output('download-report', 'data'),
     [Input('download-report-button', 'n_clicks')],
@@ -1179,5 +2061,16 @@ if __name__ == '__main__':
         webbrowser.open(f"http://localhost:{port}")
         app.run(host='127.0.0.1', port=port, debug=True)
     except Exception as e:
-        logger.error(f"Error starting Dash server: {e}")
+        logger.error(f"Error starting Dash server: {e}")# -*- coding: utf-8 -*-
+"""
+Spyder Editor
 
+This is a temporary script file.
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jul 17 12:39:30 2025
+
+@author: denisova
+"""
