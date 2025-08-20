@@ -47,6 +47,12 @@ import multiprocessing
 from filter_and_trim_function import filter_and_trim_parallel
 from vsearch_multithread import merge_worker, calculate_distance_pair_worker
 from itertools import combinations# Set up logging
+import bambi as bmb
+import arviz as az
+import pymc as pm
+import pytensor.tensor as pt
+import patsy 
+import arviz as az
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -199,7 +205,17 @@ html.Br(),
         # --- Independent Mixed-Effect Model Section ---
         html.H4("Mixed-Effect Model Parameters", style={'color': '#555'}),
         html.P("These inputs are independent of the 'Treatment Group Column' above.", style={'fontSize': 'small', 'color': 'gray'}),
-        
+        html.Label("Model Type:"),
+        dcc.Dropdown(
+            id='model-type-dropdown',
+            options=[
+                {'label': 'Negative Binomial GEE (Faster, Frequentist)', 'value': 'gee'},
+                {'label': 'Bayesian ZINB Mixed Model (PyMC)', 'value': 'pymc_zinb'}
+            ],
+            value='pymc_zinb',
+            clearable=False
+        ),
+        html.Br(),
         html.Label("Main Factor to Test (Fixed Effect):"),
         dcc.Input(id='mem-treatment-col', value='Substrate', type='text'),
 
@@ -218,7 +234,8 @@ html.Br(),
             value='Genus',
             clearable=False
         ),
-
+        html.Label("Number of Top Features for Model (default 20):"),
+        dcc.Input(id='mem-top-n-features', value=20, type='number'),
         html.Label("Grouping Variable (Random Effect):"),
         dcc.Input(id='random-effect-col', value='Run', type='text'),
 
@@ -1599,40 +1616,31 @@ import statsmodels.formula.api as smf
 def run_mixed_effect_model(ps1_object, treatment_col, random_effect_col, time_col,
                            analysis_level, top_n_features=20):
     """
-    Runs a Negative Binomial GEE model with a DYNAMIC formula builder that
-    correctly handles an optional second factor (time_col).
+    Runs a Negative Binomial GEE and now merges the results with the taxonomy
+    table to return a fully annotated DataFrame.
     """
     logger.info(f"Running Negative Binomial GEE at the {analysis_level} level...")
     try:
         asv_table = ps1_object['asv'].astype(int)
         metadata = ps1_object['meta']
-        taxa = ps1_object['tax']
+        taxa = ps1_object['tax'] # This is our full taxonomy table
 
-        # --- CORRECTED DYNAMIC FORMULA LOGIC ---
-        
-        # 1. Start with the essential columns that are always required.
         required_cols = [treatment_col, random_effect_col]
+        use_time_col = time_col and time_col.strip() and time_col in metadata.columns
+        if top_n_features is None or top_n_features <= 0:
+            top_n_features = 20
+            logger.info(f"Top N features not specified; using default value of {top_n_features}")
+        if use_time_col:
+            required_cols.append(time_col)
         
-        # 2. Check if these essential columns exist.
         if any(col not in metadata.columns for col in required_cols):
             missing = [col for col in required_cols if col not in metadata.columns]
-            logger.error(f"FATAL: Metadata is missing essential columns: {missing}")
+            logger.error(f"FATAL: Metadata is missing required columns: {missing}")
             return pd.DataFrame()
 
-        # 3. Build the model formula dynamically.
-        #    Check if time_col has a value AND if that column actually exists in the metadata.
-        use_time_col = time_col and time_col.strip() and time_col in metadata.columns
-        
         model_formula = f"abundance ~ {treatment_col}"
         if use_time_col:
             model_formula += f" * {time_col}"
-            required_cols.append(time_col) # Only add it to the list if it's being used
-            logger.info(f"Building full interaction model: {model_formula}")
-        else:
-            if time_col and time_col.strip(): # User typed something, but it wasn't found
-                logger.warning(f"Second factor '{time_col}' not found in metadata. Building simple model.")
-            logger.info(f"Building simple model: {model_formula}")
-        # --- END OF CORRECTED LOGIC ---
 
         if analysis_level == 'ASV':
             feature_table = asv_table.T
@@ -1641,7 +1649,6 @@ def run_mixed_effect_model(ps1_object, treatment_col, random_effect_col, time_co
             feature_table = aggregated_table.T
 
         if feature_table.empty:
-            logger.warning(f"Feature table is empty for {analysis_level} level.")
             return pd.DataFrame()
 
         top_features = feature_table.sum(axis=0).nlargest(top_n_features).index
@@ -1665,84 +1672,251 @@ def run_mixed_effect_model(ps1_object, treatment_col, random_effect_col, time_co
                 )
                 gee_results = gee_model.fit()
                 
-                logger.info(f"SUCCESSFULLY fitted GEE model for {feature_id}.")
-                
                 p_values = gee_results.pvalues
                 coeffs = gee_results.params
                 conf_int = gee_results.conf_int()
                 
-                feature_name_for_table = f"ASV_{i+1}" if analysis_level == 'ASV' else feature_id
                 for var in p_values.index:
                     if p_values[var] < 0.05:
-                        result = {'Feature': feature_name_for_table, 'Variable': var, 'Coefficient': coeffs[var], 'P-value': p_values[var], 'Conf. Int. Lower': conf_int.loc[var, 0], 'Conf. Int. Upper': conf_int.loc[var, 1]}
-                        if analysis_level == 'ASV': result['Description'] = feature_id
+                        # For the feature_id, we store the actual ASV sequence or Taxon name
+                        result = {
+                            'Feature_ID': feature_id, # This is our key for merging
+                            'Variable': var, 'Coefficient': coeffs[var], 'P-value': p_values[var],
+                            'Conf. Int. Lower': conf_int.loc[var, 0], 'Conf. Int. Upper': conf_int.loc[var, 1]
+                        }
                         all_results.append(result)
             except Exception as e:
-                feature_name_for_table = f"ASV_{i+1}" if analysis_level == 'ASV' else feature_id
-                logger.warning(f"FAILED to fit GEE for {feature_name_for_table}. Reason: {e}")
+                logger.warning(f"FAILED to fit GEE for {feature_id}. Reason: {e}")
                 continue
         
         if not all_results:
-            logger.info("Model fitting complete. No statistically significant associations were found (p < 0.05).")
+            logger.info("Model fitting complete. No statistically significant associations were found.")
             return pd.DataFrame()
-        return pd.DataFrame(all_results)
+
+        # --- NEW: Post-analysis merging with taxonomy ---
+        results_df = pd.DataFrame(all_results)
+        
+        if analysis_level == 'ASV':
+            # The 'Feature_ID' is the ASV sequence, which is the index of the taxa table
+            annotated_df = results_df.merge(taxa, left_on='Feature_ID', right_index=True, how='left')
+        else:
+            # For taxon level, we create a representative taxonomy table to merge with
+            # This avoids creating duplicate rows from the main taxa table
+            representative_taxa = taxa.groupby(taxa[analysis_level]).first()
+            annotated_df = results_df.merge(representative_taxa, left_on='Feature_ID', right_index=True, how='left')
+
+        return annotated_df.sort_values('P-value')
 
     except Exception as e:
         logger.error(f"CRITICAL ERROR in run_mixed_effect_model function: {e}", exc_info=True)
         return pd.DataFrame()
 
+    
+from joblib import Parallel, delayed
+import pymc as pm
+import patsy
+import arviz as az
+import pytensor.tensor as pt
+import numpy as np
+
+def _fit_zinb_for_one_feature(feature_id, feature_table, metadata, model_formula, random_effect_col):
+    """
+    Worker function to fit a PyMC ZINB model for a single taxonomic feature.
+    Designed to be called in parallel. It is self-contained.
+    """
+    try:
+        # 1. Prepare the data for this specific feature
+        df_long = metadata.join(feature_table[feature_id].rename('abundance')).dropna()
+
+        if df_long.empty or df_long['abundance'].var() == 0:
+            return None # Return nothing if data is invalid for this feature
+
+        # 2. Use Patsy to create design matrices
+        y_patsy, X_patsy = patsy.dmatrices(model_formula, data=df_long)
+        y_values = np.asarray(y_patsy).flatten().astype(int)
+        X_matrix = np.asarray(X_patsy)
+        predictor_names = X_patsy.design_info.column_names
+
+        # 3. Create indices for the random effect groups
+        group_labels = df_long[random_effect_col].astype('category')
+        group_idx = group_labels.cat.codes.values
+        num_groups = len(group_labels.cat.categories)
+
+        # 4. Define and run the PyMC model
+        with pm.Model() as model:
+            # Priors for fixed effects (using tighter, more stable priors)
+            betas = pm.Normal("betas", mu=0, sigma=5, shape=X_matrix.shape[1])
+
+            # Non-Centered parameterization for the random effect (CRITICAL for stability)
+            offset_raw = pm.Normal("offset_raw", mu=0, sigma=1, shape=num_groups)
+            sigma_random = pm.HalfNormal("sigma_random", sigma=2)
+            offset_random = pm.Deterministic("offset_random", offset_raw * sigma_random)
+
+            # Priors for dispersion and zero-inflation
+            alpha = pm.HalfCauchy("alpha", beta=1)
+            psi_intercept = pm.Normal("psi_intercept", mu=0, sigma=5)
+
+            # Linear Model
+            est = X_matrix @ betas + offset_random[group_idx]
+            mu = pt.exp(est)
+            psi = pm.math.invlogit(psi_intercept)
+
+            # Likelihood
+            y_obs = pm.ZeroInflatedNegativeBinomial("y_obs", psi=psi, alpha=alpha, mu=mu, observed=y_values)
+
+            # Sampling: CRITICAL - each worker uses only ONE core. Joblib manages the rest.
+            idata = pm.sample(
+                draws=2000, tune=1500, chains=4, 
+                target_accept=0.999, 
+                cores=1,            # <--- Each worker gets 1 core
+                progressbar=False   # <--- Keep this off to prevent console flooding
+            )
+
+        # 5. Extract and return significant results
+        posterior_betas = idata.posterior["betas"]
+        feature_results = []
+        for i, var_name in enumerate(predictor_names):
+            beta_samples = posterior_betas.sel(betas_dim_0=i).values.flatten()
+            mean_coeff = beta_samples.mean()
+            hdi_low, hdi_high = az.hdi(beta_samples, hdi_prob=0.94)
+
+            if (hdi_low > 0 and hdi_high > 0) or (hdi_low < 0 and hdi_high < 0):
+                feature_results.append({
+                    'Feature_ID': feature_id, 'Variable': var_name, 'Coefficient': mean_coeff,
+                    'P-value': '< 0.05 (Bayesian)', 'Conf. Int. Lower': hdi_low, 'Conf. Int. Upper': hdi_high
+                })
+        
+        logger.info(f"Successfully completed analysis for feature: {feature_id}")
+        return feature_results
+
+    except Exception as e:
+        # A robust worker function logs errors but does not crash the whole process
+        logger.warning(f"FAILED to fit PyMC ZINB model for '{feature_id}'. Reason: {e}")
+        return None # Return nothing on failure
+
+
+
+def run_pymc_zinb_mixed_model(ps1_object, treatment_col, random_effect_col, time_col,
+                               analysis_level, top_n_features=20):
+    """
+    Runs a Bayesian ZINB Mixed-Effects model in PARALLEL using joblib.
+    This function acts as the orchestrator.
+    """
+    logger.info(f"Running PARALLEL Bayesian ZINB Model at the {analysis_level} level...")
+    if top_n_features is None or top_n_features <= 0:
+        top_n_features = 20
+
+    try:
+        # --- 1. Initial Data Setup (same as before) ---
+        asv_table = ps1_object['asv'].astype(int)
+        metadata = ps1_object['meta']
+        taxa = ps1_object['tax']
+
+        model_formula = f"abundance ~ {treatment_col}"
+        use_time_col = time_col and time_col.strip() and time_col in metadata.columns
+        if use_time_col:
+            model_formula += f" * {time_col}"
+
+        if analysis_level == 'ASV':
+            feature_table = asv_table.T
+        else:
+            feature_table = asv_table.groupby(by=taxa[analysis_level]).sum().T
+
+        top_features = feature_table.sum(axis=0).nlargest(top_n_features).index
+
+        # --- 2. Run the Worker Function in Parallel ---
+        # n_jobs=-1 tells joblib to use all available CPU cores.
+        # This is where the parallelization happens!
+        logger.info(f"Distributing analysis of {len(top_features)} features across multiple CPU cores...")
+        
+        all_results_list = Parallel(n_jobs=-1)(
+            delayed(_fit_zinb_for_one_feature)(
+                feature_id, feature_table, metadata, model_formula, random_effect_col
+            ) for feature_id in top_features
+        )
+
+        # --- 3. Collect and Process the Results ---
+        # The output is a list of lists (and Nones for failed models).
+        # We flatten it into a single clean list of result dictionaries.
+        all_results = [item for sublist in all_results_list if sublist for item in sublist]
+
+        if not all_results:
+            logger.info("Parallel model fitting complete. No statistically significant associations found.")
+            return pd.DataFrame()
+
+        results_df = pd.DataFrame(all_results)
+
+        # Annotate with taxonomy (same as before)
+        if analysis_level == 'ASV':
+            annotated_df = results_df.merge(taxa, left_on='Feature_ID', right_index=True, how='left')
+        else:
+            representative_taxa = taxa.groupby(taxa[analysis_level]).first()
+            annotated_df = results_df.merge(representative_taxa, left_on='Feature_ID', right_index=True, how='left')
+
+        logger.info("Successfully completed parallel ZINB analysis.")
+        return annotated_df.sort_values('Coefficient', key=abs, ascending=False)
+
+    except Exception as e:
+        logger.error(f"CRITICAL ERROR in parallel PyMC model orchestrator: {e}", exc_info=True)
+        return pd.DataFrame()
+
+
 def format_lme_results_for_display(results_df, ps1_object, treatment_col, time_col):
     """
-    Translates raw model output into a human-readable HTML table with interpretations.
+    Presents the fully annotated model output in a rich HTML table.
+    This version correctly handles both numeric and string-based p-values.
     """
     if results_df is None or results_df.empty:
         return html.Div([
             html.H4("Mixed-Effect Model Results"),
-            html.P("No significant associations were found or the model could not be run.")
+            html.P("No significant associations were found.")
         ])
 
     baseline = sorted(ps1_object['meta'][treatment_col].unique())[0]
-    
-    interpreted_rows = []
-    for _, row in results_df.iterrows():
-        var = row['Variable']
-        coeff = row['Coefficient']
-        fold_change = np.exp(coeff)
-        
-        interpretation = ""
-        if var == 'Intercept':
-            interpretation = f"Baseline abundance"
-        elif f"T.{treatment_col}" in var or treatment_col in var:
-            category = var.replace(f"{treatment_col}[T.", "").replace("]", "")
-            interpretation = f"Effect of {category} (vs. {baseline})"
-        elif time_col and time_col in var and ":" not in var:
-            interpretation = f"Effect of one-unit increase in {time_col}"
-        elif time_col and ":" in var:
-            parts = var.split(':')
-            cat_part = [p for p in parts if treatment_col in p][0]
-            category = cat_part.replace(f"{treatment_col}[T.", "").replace("]", "")
-            interpretation = f"Interaction: How {time_col} effect changes in {category}"
+    display_cols = ['Feature_ID', 'Interpretation', 'Fold Change', 'P-value', 'Phylum', 'Order', 'Family', 'Genus', 'Species']
+    df = results_df.copy()
 
-        interpreted_rows.append({
-            'Feature': row['Feature'],
-            'Interpretation': interpretation,
-            'Fold Change': f"{fold_change:.2f}x",
-            'P-value': f"{row['P-value']:.2e}"
-        })
-    
-    display_df = pd.DataFrame(interpreted_rows)
-    table_header = [html.Thead(html.Tr([html.Th(col) for col in display_df.columns]))]
-    table_body = [html.Tbody([html.Tr([html.Td(display_df.iloc[i][col]) for col in display_df.columns]) for i in range(len(display_df))])]
-    
+    df['Fold Change'] = np.exp(df['Coefficient'])
+
+    def get_interpretation(row):
+        var = row['Variable']
+        if var == 'Intercept': return "Baseline abundance"
+        if f"T.{treatment_col}" in var or treatment_col in var:
+            category = var.replace(f"{treatment_col}[T.", "").replace("]", "")
+            return f"Effect of {category} (vs. {baseline})"
+        if time_col and time_col in var and ":" not in var:
+            return f"Effect of one-unit increase in {time_col}"
+        if time_col and ":" in var:
+            return "Interaction Effect"
+        return var
+
+    df['Interpretation'] = df.apply(get_interpretation, axis=1)
+
+    # --- THIS IS THE CRITICAL FIX ---
+    # Check if the 'P-value' column contains numbers before trying to format them.
+    if pd.api.types.is_numeric_dtype(df['P-value']):
+        # This will only run for the GEE model's output
+        df['P-value'] = df['P-value'].map('{:.2e}'.format)
+    # If the p-values are strings (from the Bayesian model), this block is skipped.
+
+    df['Fold Change'] = df['Fold Change'].map('{:.2f}x'.format)
+    df.rename(columns={'Feature_ID': 'Feature'}, inplace=True)
+
+    final_df = df[[col for col in display_cols if col in df.columns]]
+    final_df.fillna('-', inplace=True)
+
+    table_header = [html.Thead(html.Tr([html.Th(col) for col in final_df.columns]))]
+    table_body = [html.Tbody([html.Tr([html.Td(final_df.iloc[i][col]) for col in final_df.columns]) for i in range(len(final_df))])]
+
     return html.Div([
         html.H4("Significant Associations from Mixed-Effect Model"),
         html.P(f"Shows variables significantly associated with feature abundance. The baseline for comparison is '{baseline}'."),
-        html.Table(table_header + table_body, style={'marginLeft': 'auto', 'marginRight': 'auto', 'marginTop': '20px'})
+        html.Table(table_header + table_body, style={'marginLeft': 'auto', 'marginRight': 'auto', 'marginTop': '20px', 'textAlign': 'left'})
     ])
 
 def plot_lme_results(results_df):
     """
-    Creates a forest plot visualizing the model's effect sizes and confidence intervals.
+    Creates a forest plot, now using the full Feature_ID for more descriptive labels.
     """
     if results_df is None or results_df.empty or 'Conf. Int. Lower' not in results_df.columns:
         return go.Figure(layout_title_text="No significant results to plot.")
@@ -1752,7 +1926,8 @@ def plot_lme_results(results_df):
     df['FC Lower'] = np.exp(df['Conf. Int. Lower'])
     df['FC Upper'] = np.exp(df['Conf. Int. Upper'])
     
-    df['Plot Label'] = df['Feature'] + " by " + df['Variable']
+    # Use the more descriptive 'Feature_ID' for the plot
+    df['Plot Label'] = df['Feature_ID'] + " by " + df['Variable']
     df = df.sort_values('Fold Change')
 
     fig = px.scatter(
@@ -1761,8 +1936,7 @@ def plot_lme_results(results_df):
         log_x=True,
         labels={'Fold Change': 'Fold Change (log scale)', 'Plot Label': 'Feature and Variable'},
         title='Mixed-Effect Model Results (Forest Plot)',
-        width=1200, # Width in pixels
-        height=800  # Height in pixels
+        width=1200, height=800
     )
     
     fig.add_vline(x=1.0, line_width=2, line_dash="dash", line_color="grey")
@@ -2101,11 +2275,15 @@ def toggle_preprocessing_params(analysis_mode):
      State('random-effect-col', 'value'),
      State('time-col', 'value'),
      State('analysis-level-dropdown', 'value'),
-     State('mem-treatment-col', 'value')],
+     State('mem-treatment-col', 'value'),
+     State('mem-top-n-features', 'value'),
+     State('model-type-dropdown', 'value')],
     prevent_initial_call=True
 )
 def run_analysis(n_clicks, analysis_mode, data_folder_path, output_dir,
-                 trunc_len_f, trunc_len_r, max_ee_str, treatment, subset_groups, top_asvs, background, silva_content,random_effect_col, time_col, analysis_level,mem_treatment):
+                 trunc_len_f, trunc_len_r, max_ee_str, treatment, subset_groups, 
+                 top_asvs, background, silva_content,random_effect_col, time_col, 
+                 analysis_level,mem_treatment, mem_top_n,model_type):
     try:
         if n_clicks == 0:
             return [dash.no_update] * 13
@@ -2270,7 +2448,14 @@ def run_analysis(n_clicks, analysis_mode, data_folder_path, output_dir,
         indicator_species_output, indicator_raw_df = run_indicator_species(ps1, treatment)
 
 
-        lme_results_df = run_mixed_effect_model(ps1, mem_treatment, random_effect_col, time_col, analysis_level)
+        if model_type == 'pymc_zinb':
+            logger.info("User selected: Bayesian ZINB Mixed Model (PyMC)")
+            # Make sure you have created the run_zinb_mixed_model_bambi function
+            lme_results_df = run_pymc_zinb_mixed_model(ps1, mem_treatment, random_effect_col, time_col, analysis_level, mem_top_n)
+        else:
+            logger.info("User selected: Negative Binomial GEE (Statsmodels).")
+            lme_results_df = run_mixed_effect_model(ps1, mem_treatment, random_effect_col, time_col, analysis_level, mem_top_n)
+        
         mixed_model_output = format_lme_results_for_display(lme_results_df, ps1, mem_treatment, time_col)
         mixed_model_plot = plot_lme_results(lme_results_df)
         #Other outputs
@@ -2371,15 +2556,3 @@ if __name__ == '__main__':
         app.run(host='127.0.0.1', port=port, debug=True)
     except Exception as e:
         logger.error(f"Error starting Dash server: {e}")# -*- coding: utf-8 -*-
-"""
-Spyder Editor
-
-This is a temporary script file.
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Jul 17 12:39:30 2025
-
-@author: denisova
-"""
