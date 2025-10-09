@@ -1,4 +1,3 @@
-
 import os
 import base64
 import uuid
@@ -14,15 +13,17 @@ from .config import logger
 from .data.sample_data import sample_metadata_df, sample_seqtab, sample_taxa
 from .ai_utils import ai_available, ai_analyze_background, ai_analyze_quality_profiles, ai_analyze_metadata, ai_interpret_results
 from .pipeline_steps import filter_and_trim_parallel, denoise_and_create_asv_table_vsearch, assign_taxonomy
-from .analysis import (create_phyloseq_object, calculate_alpha_diversity, calculate_beta_diversity, 
-                       perform_pcoa, perform_pca, perform_nmds)
+from .analysis import (
+    create_phyloseq_object, calculate_alpha_diversity, calculate_beta_diversity,
+    perform_pcoa, perform_pca, perform_nmds, perform_pcoa_aitchison
+)
 from .statistics import (perform_pairwise_alpha_tests, run_permanova, run_differential_abundance, 
                          run_indicator_species, run_mixed_effect_model, run_pymc_zinb_mixed_model)
-from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abundance_by_order, 
+from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abundance_by_order, plot_abundance_by_taxlevel, 
                        plot_lme_results, format_lme_results_for_display)
 from .reporting import generate_pdf_report
 from .utils import fill_taxonomy_forward
-
+from dash import no_update
 # --- Initialize Dash App ---
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
@@ -97,10 +98,12 @@ app.layout = html.Div([
                     html.H3("Beta Diversity & Ordination"),
                     html.Div(id='permanova-results', style={'textAlign': 'center'}),
                     dcc.Graph(id='pcoa-plot'),
+                    dcc.Graph(id='pcoa-aitchison-plot'),
                     dcc.Graph(id='pca-plot'),
                     dcc.Graph(id='nmds-plot'),
                     html.H3("Taxonomic Composition"),
                     dcc.Graph(id='abundance-order-plot'),
+                    dcc.Graph(id='abundance-genus-plot'),
                     html.H3("Statistical Comparisons"),
                     html.Div(id='differential-abundance-results'),
                     html.Div(id='indicator-species-results'),
@@ -150,15 +153,58 @@ def list_files(n_clicks, folder_path):
 )
 def toggle_preprocessing_params(mode):
     return {'display': 'block'} if mode == 'fastq' else {'display': 'none'}
+@app.callback(
+    [Output('subset-groups-dropdown', 'options'),
+     Output('subset-groups-dropdown', 'value'),
+     Output('subset-groups-dropdown', 'disabled')],
+    [Input('treatment-group', 'value'),
+     Input('load-sample-data', 'n_clicks'),
+     Input('list-files-button', 'n_clicks')],
+    State('data-folder-path', 'value'),
+    prevent_initial_call=True
+)
+def populate_subset_options(treat_col, n_sample, n_list, data_path):
+    try:
+        if 'sample_data_mode' in global_data:
+            meta_df = sample_metadata_df.copy()
+        else:
+            if not data_path or not os.path.isdir(data_path):
+                return [], None, True
+            files = os.listdir(data_path)
+            meta_file = next((f for f in files if f.lower().endswith(('.csv', '.tsv', '.txt'))), None)
+            if not meta_file:
+                return [], None, True
+            meta_path = os.path.join(data_path, meta_file)
+            ext = os.path.splitext(meta_file)[1].lower()
+            sep = '\t' if ext in ('.tsv', '.txt') else ','
+            meta_df = pd.read_csv(meta_path, sep=sep, index_col=0)
 
+        if not treat_col or treat_col not in meta_df.columns:
+            return [], None, True
+
+        groups = (
+            meta_df[treat_col]
+            .astype(str).str.strip()
+            .replace({'nan': np.nan})
+            .dropna().unique().tolist()
+        )
+        groups = sorted(groups)
+        options = [{'label': g, 'value': g} for g in groups]
+        return options, None, False
+
+    except Exception as e:
+        logger.error(f"Could not populate subsetting options: {e}", exc_info=True)
+        return [], None, True
 @app.callback(
     [Output('seq-depth-plot', 'figure'),
      Output('alpha-diversity-plot', 'figure'),
      Output('pcoa-plot', 'figure'),
+     Output('pcoa-aitchison-plot', 'figure'),
      Output('pca-plot', 'figure'),
      Output('nmds-plot', 'figure'),
      Output('permanova-results', 'children'),
      Output('abundance-order-plot', 'figure'),
+     Output('abundance-genus-plot', 'figure'),
      Output('differential-abundance-results', 'children'),
      Output('indicator-species-results', 'children'),
      Output('phylogenetic-tree', 'children'),
@@ -179,9 +225,27 @@ def toggle_preprocessing_params(mode):
 def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trunc_r, max_ee, treat_col,
                       subset, top_asvs, background, silva_content, model_type, mem_treat, time_col,
                       rand_eff, analysis_lvl, mem_top_n, mem_ref, mem_show_insig, force_feat):
-
     if n_clicks == 0:
-        return [go.Figure()] * 7 + [html.Div()] * 3 + [html.Div(), go.Figure()] + [dcc.Markdown(), html.Div()]
+        empty_fig = go.Figure()
+        empty_div = html.Div()
+        return [
+            empty_fig,  # 1 seq-depth-plot
+            empty_fig,  # 2 alpha-diversity-plot
+            empty_fig,  # 3 pcoa-plot
+            empty_fig,  # 4 pcoa-aitchison-plot
+            empty_fig,  # 5 pca-plot
+            empty_fig,  # 6 nmds-plot
+            empty_div,  # 7 permanova-results
+            empty_fig,  # 8 abundance-order-plot
+            empty_fig,  # 9 abundance-genus-plot
+            empty_div,  # 10 differential-abundance-results
+            empty_div,  # 11 indicator-species-results
+            empty_div,  # 12 phylogenetic-tree
+            empty_div,  # 13 mixed-model-results
+            empty_fig,  # 14 mixed-model-plot
+            dcc.Markdown(),  # 15 ai-interpretations
+            empty_div   # 16 output-files
+        ]
 
     try:
         global_data.clear() # Reset data for new run
@@ -205,8 +269,10 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                 logger.info("Starting analysis from FASTQ files.")
                 fnFs = sorted([os.path.join(data_path, f) for f in files if '_R1' in f.upper()])
                 fnRs = sorted([os.path.join(data_path, f) for f in files if '_R2' in f.upper()])
-                s_names = [os.path.basename(f).split('_')[0] for f in fnFs]
-                meta_df = meta_df.loc[s_names].copy()
+                # Build sample names and align metadata safely
+                s_names = [os.path.basename(f).split('_')[0].strip() for f in fnFs]
+                meta_df.index = meta_df.index.astype(str).str.strip()
+                meta_df = meta_df.reindex(s_names)
                 filtFs, filtRs = filter_and_trim_parallel(fnFs, fnRs, s_names, out_dir, trunc_f, trunc_r, max_ee)
                 seqtab = denoise_and_create_asv_table_vsearch(filtFs, filtRs, s_names, out_dir)
                 silva_path = os.path.join(data_path, 'silva.fasta')
@@ -215,14 +281,35 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                     silva_path = os.path.join(out_dir, 'uploaded_silva.fasta')
                     with open(silva_path, 'wb') as f: f.write(base64.b64decode(content_string))
                 taxa_df = assign_taxonomy(list(seqtab.columns), os.path.join(out_dir, 'asvs.fa'), silva_path, out_dir)
-            else: # ASV mode
+            else:  # ASV mode
                 logger.info("Starting analysis from pre-processed tables.")
-                asv_path, taxa_path = os.path.join(out_dir, 'microbiome_ai_16s_asv.csv'), os.path.join(out_dir, 'microbiome_ai_taxonomy.csv')
+                asv_path = os.path.join(out_dir, 'microbiome_ai_16s_asv.csv')
+                taxa_path = os.path.join(out_dir, 'microbiome_ai_taxonomy.csv')
                 if not (os.path.exists(asv_path) and os.path.exists(taxa_path)):
                     raise FileNotFoundError("Run in FASTQ mode first to generate ASV/Taxonomy tables in the output directory.")
                 seqtab = pd.read_csv(asv_path, sep='\t', index_col=0, engine='python')
                 taxa_df = pd.read_csv(taxa_path, index_col=0)
-                meta_df = meta_df.loc[seqtab.index].copy()
+
+        # --- Normalize sample IDs so ASV table and metadata align (runs for both modes) ---
+        seqtab.index = seqtab.index.map(lambda x: str(x).strip())
+
+        if 'SampleID' in meta_df.columns:
+            meta_df = meta_df.copy()
+            meta_df['SampleID'] = meta_df['SampleID'].astype(str).str.strip()
+            meta_df = meta_df.set_index('SampleID')
+        else:
+            meta_df.index = meta_df.index.map(lambda x: str(x).strip())
+
+        missing_in_meta = sorted(set(seqtab.index) - set(meta_df.index))
+        missing_in_seq  = sorted(set(meta_df.index) - set(seqtab.index))
+        if missing_in_meta:
+            logger.warning(f"Samples in ASV table but missing in metadata (up to 10): "
+                           f"{missing_in_meta[:10]}{'...' if len(missing_in_meta) > 10 else ''}")
+        if missing_in_seq:
+            logger.warning(f"Samples in metadata but not in ASV table (up to 10): "
+                           f"{missing_in_seq[:10]}{'...' if len(missing_in_seq) > 10 else ''}")
+
+        meta_df = meta_df.reindex(seqtab.index)
 
         taxa_filled = fill_taxonomy_forward(taxa_df)
         global_data['seqtab_nochim'], global_data['taxa'] = seqtab, taxa_filled
@@ -247,21 +334,55 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         pcoa_scores, dm, pcoa_var = perform_pcoa(asv_rel, meta_rel, treat_col)
         global_data['pcoa_scores'] = pcoa_scores
         permanova_res = run_permanova(dm, meta_rel, treat_col)
-        pcoa_fig = px.scatter(pcoa_scores, x='PC1', y='PC2', color=treat_col, title="PCoA (Bray-Curtis)", labels={"PC1": f"PC1 ({pcoa_var['PC1']*100:.2f}%)", "PC2": f"PC2 ({pcoa_var['PC2']*100:.2f}%)"})
+        pcoa_fig = px.scatter(
+            pcoa_scores, x='PC1', y='PC2', color=treat_col,
+            title="PCoA (Bray-Curtis)",
+            labels={"PC1": f"PC1 ({pcoa_var['PC1']*100:.2f}%)",
+                    "PC2": f"PC2 ({pcoa_var['PC2']*100:.2f}%)"}
+        )
         global_data['pcoa_fig'] = pcoa_fig
 
+        # NEW: Aitchison (CLR-Euclidean) PCoA
+        pcoa_ait_scores, dm_ait, var_ait = perform_pcoa_aitchison(ps1, treat_col)
+        var_vals = np.asarray(var_ait).ravel()  # robust to Series/array/list
+        pc1_lbl = f"PC1 ({(var_vals[0]*100):.2f}%)" if len(var_vals) > 0 else "PC1"
+        pc2_lbl = f"PC2 ({(var_vals[1]*100):.2f}%)" if len(var_vals) > 1 else "PC2"
+        pcoa_ait_fig = px.scatter(
+            pcoa_ait_scores,
+            x=pcoa_ait_scores.columns[0],
+            y=pcoa_ait_scores.columns[1],
+            color=treat_col,
+            title="PCoA (Aitchison / CLR-Euclidean)",
+            labels={pcoa_ait_scores.columns[0]: pc1_lbl,
+                    pcoa_ait_scores.columns[1]: pc2_lbl}
+        )
+
         nmds_scores, nmds_stress = perform_nmds(dm)
-        nmds_fig = px.scatter(nmds_scores.join(ps1['meta'][[treat_col]]), x='NMDS1', y='NMDS2', color=treat_col, title=f"NMDS (Stress: {nmds_stress:.4f})") if nmds_scores is not None else go.Figure(layout_title_text="NMDS Failed")
+        nmds_fig = (
+            px.scatter(
+                nmds_scores.join(ps1['meta'][[treat_col]]),
+                x='NMDS1', y='NMDS2', color=treat_col,
+                title=f"NMDS (Stress: {nmds_stress:.4f})"
+            )
+            if nmds_scores is not None else go.Figure(layout_title_text="NMDS Failed")
+        )
 
         pca_res, pca_var = perform_pca(ps1['asv'], int(top_asvs))
         pca_df = pd.DataFrame(pca_res, columns=['PC1', 'PC2'], index=ps1['meta'].index).join(ps1['meta'][treat_col])
-        pca_fig = px.scatter(pca_df, x='PC1', y='PC2', color=treat_col, title=f"PCA (Top {top_asvs} ASVs)", labels={"PC1": f"PC1 ({pca_var[0]*100:.2f}%)", "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"})
+        pca_fig = px.scatter(
+            pca_df, x='PC1', y='PC2', color=treat_col,
+            title=f"PCA (Top {top_asvs} ASVs)",
+            labels={"PC1": f"PC1 ({pca_var[0]*100:.2f}%)",
+                    "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"}
+        )
 
         # Plots & Stats
         seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
         global_data['seq_depth_fig'] = seq_depth_fig
         abund_order_fig = plot_abundance_by_order(ps1, treat_col)
         global_data['abundance_order_plot'] = abund_order_fig
+        abund_genus_fig = plot_abundance_by_taxlevel(ps1, treat_col, tax_level="Genus", threshold=0.01)
+        global_data['abundance_genus_plot'] = abund_genus_fig
 
         diff_abund_res = run_differential_abundance(ps1, treat_col)
         indic_spec_res, indic_df = run_indicator_species(ps1, treat_col)
@@ -277,22 +398,44 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         mix_model_plot = plot_lme_results(lme_res_df, mem_show_insig)
 
         # AI Interpretation & Outputs
-        global_data['ps1_melt'] = ps1['asv'].T.reset_index().melt(id_vars=['SampleID'], var_name='ASV', value_name='Abundance')
+        df_asv = ps1['asv'].T.rename_axis('SampleID').reset_index()
+        global_data['ps1_melt'] = df_asv.melt(id_vars='SampleID', var_name='ASV', value_name='Abundance')
         global_data['pca_result'] = (pca_res, pca_var)
         ai_interp = ai_interpret_results(global_data, background, treat_col)
         out_files = html.Div([html.P(f) for f in os.listdir(out_dir) if f.endswith('.csv')])
 
         logger.info("Analysis completed successfully.")
-        return (seq_depth_fig, alpha_fig, pcoa_fig, pca_fig, nmds_fig, permanova_res, abund_order_fig,
-                diff_abund_res, indic_spec_res, html.Img(src=tree_img, style={'width': '100%'}) if tree_img else html.P("Tree could not be generated."),
-                mix_model_res, mix_model_plot, dcc.Markdown(ai_interp), out_files)
+        return (
+            seq_depth_fig, alpha_fig, pcoa_fig, pcoa_ait_fig, pca_fig, nmds_fig, permanova_res,
+            abund_order_fig, abund_genus_fig,
+            diff_abund_res, indic_spec_res,
+            html.Img(src=tree_img, style={'width': '100%'}) if tree_img else html.P("Tree could not be generated."),
+            mix_model_res, mix_model_plot, dcc.Markdown(ai_interp), out_files
+        )
 
     except Exception as e:
         logger.error(f"Error during analysis: {e}", exc_info=True)
         error_fig = go.Figure(layout_title_text=f"Error: {e}")
-        error_msg = html.Div([html.H4("Analysis Failed"), html.P(f"Details: {e}")], style={'color': 'red', 'fontWeight': 'bold'})
-        empty_outputs = [go.Figure()] * 7 + [error_msg] * 3 + [error_msg, go.Figure()] + [dcc.Markdown(f"### Error\n{e}"), error_msg]
-        return empty_outputs
+        error_msg = html.Div([html.H4("Analysis Failed"), html.P(f"Details: {e}")],
+                             style={'color': 'red', 'fontWeight': 'bold'})
+        return [
+            error_fig,  # 1 seq-depth-plot
+            error_fig,  # 2 alpha-diversity-plot
+            error_fig,  # 3 pcoa-plot
+            error_fig,  # 4 pcoa-aitchison-plot
+            error_fig,  # 5 pca-plot
+            error_fig,  # 6 nmds-plot
+            error_msg,  # 7 permanova-results
+            error_fig,  # 8 abundance-order-plot
+            error_fig,  # 9 abundance-genus-plot
+            error_msg,  # 10 differential-abundance-results
+            error_msg,  # 11 indicator-species-results
+            error_msg,  # 12 phylogenetic-tree
+            error_msg,  # 13 mixed-model-results
+            error_fig,  # 14 mixed-model-plot
+            dcc.Markdown(f"### Error\n{e}"),  # 15 ai-interpretations
+            error_msg   # 16 output-files
+        ]
 
 @app.callback(
     Output('download-report', 'data'),

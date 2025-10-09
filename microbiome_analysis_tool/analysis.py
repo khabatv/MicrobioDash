@@ -1,5 +1,8 @@
 
 import pandas as pd
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from skbio import DistanceMatrix
 from skbio.diversity import alpha_diversity, beta_diversity
 from skbio.stats.ordination import pcoa
 from sklearn.manifold import MDS
@@ -76,6 +79,36 @@ def perform_pcoa(asv, meta, treatment):
     except Exception as e:
         logger.error(f"Error performing PCoA: {e}", exc_info=True)
         return None, None, None
+def perform_pcoa_aitchison(ps1, treat_col, pseudocount=0.5):
+    """
+    Aitchison distance = Euclidean on CLR-transformed compositions.
+    ps1['asv'] is ASV x Samples; we transpose to Samples x ASV.
+    """
+    # Samples x ASVs
+    X = ps1['asv'].T.copy()
+
+    # Pseudocount + closure (row-wise to compositional)
+    X = X + pseudocount
+    X = X.div(X.sum(axis=1), axis=0)
+
+    # CLR transform: log(x) - mean(log(x)) per sample
+    logX = np.log(X)
+    clr = logX.sub(logX.mean(axis=1), axis=0)
+
+    # Euclidean distance on CLR
+    D = squareform(pdist(clr.values, metric="euclidean"))
+    dm = DistanceMatrix(D, ids=clr.index.astype(str).tolist())
+
+    # PCoA
+    ord_res = pcoa(dm)
+    coords = ord_res.samples.iloc[:, :2].copy()
+    coords.index.name = "SampleID"
+    var = ord_res.proportion_explained
+
+    # Add metadata column for coloring
+    coords = coords.join(ps1['meta'][[treat_col]])
+
+    return coords, dm, var
 
 def perform_pca(asv, top_n):
     try:

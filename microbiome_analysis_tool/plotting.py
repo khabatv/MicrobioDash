@@ -75,7 +75,11 @@ def plot_phylogenetic_tree(seqtab, taxa, indicator_df=None):
             leaf.set_style(nstyle)
             leaf.name = f"ASV_{taxa.index.get_loc(asv_seq) + 1}"
 
-        ts = TreeStyle(mode="c", scale=20, branch_vertical_margin=10, show_leaf_name=True)
+        ts = TreeStyle()
+        ts.mode = "c"                 # "c" = circular; use "r" for rectangular
+        ts.scale = 20
+        ts.branch_vertical_margin = 10
+        ts.show_leaf_name = True
         for phylum, color in phylum_colors.items():
             if pd.notna(phylum):
                 ts.legend.add_face(CircleFace(10, color), column=0)
@@ -115,7 +119,60 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01):
     except Exception as e:
         logger.error(f"Could not generate Order-level abundance plot: {e}", exc_info=True)
         return go.Figure(layout_title_text=f"Error: {e}")
+def plot_abundance_by_taxlevel(ps1_object, treatment_column, tax_level="Genus", threshold=0.01):
+    """
+    Stacked bar of mean relative abundance by treatment, aggregated at `tax_level`.
+    `threshold` collapses low-mean taxa into 'Other'.
+    """
+    try:
+        asv_table = ps1_object['asv']  # ASVs x Samples
+        tax_df = ps1_object['tax']     # index = ASV
+        meta = ps1_object['meta']
 
+        if tax_level not in tax_df.columns:
+            return go.Figure(layout_title_text=f"{tax_level} not found in taxonomy table.")
+
+        melted = (
+            asv_table
+            .stack()
+            .reset_index(name='Abundance')
+            .rename(columns={'level_0': 'ASV', 'level_1': 'SampleID'})
+            .merge(tax_df[[tax_level]], left_on='ASV', right_index=True, how='left')
+            .merge(meta[[treatment_column]], left_on='SampleID', right_index=True, how='left')
+        )
+
+        melted[tax_level] = melted[tax_level].fillna('Unassigned')
+
+        group_tax = melted.groupby([treatment_column, tax_level])['Abundance'].sum().reset_index()
+        totals = group_tax.groupby(treatment_column)['Abundance'].transform('sum')
+        group_tax['RelativeAbundance'] = group_tax['Abundance'] / totals
+
+        mean_by_tax = group_tax.groupby(tax_level)['RelativeAbundance'].mean()
+        rare = mean_by_tax[mean_by_tax < threshold].index
+        group_tax[tax_level] = group_tax[tax_level].where(~group_tax[tax_level].isin(rare), 'Other')
+
+        final_df = (group_tax
+                    .groupby([treatment_column, tax_level])['RelativeAbundance']
+                    .sum().reset_index())
+
+        fig = px.bar(
+            final_df,
+            x=treatment_column,
+            y='RelativeAbundance',
+            color=tax_level,
+            title=f"Mean Relative Abundance by {tax_level} (>{threshold*100:.0f}%)",
+            height=700
+        )
+        fig.update_layout(
+            xaxis={'categoryorder': 'total descending'},
+            yaxis_title="Mean Relative Abundance",
+            yaxis_tickformat='.0%',
+            legend=dict(orientation="h", yanchor="bottom", y=-0.5, xanchor="center", x=0.5)
+        )
+        return fig
+    except Exception as e:
+        logger.error(f"Could not generate {tax_level}-level abundance plot: {e}", exc_info=True)
+        return go.Figure(layout_title_text=f"Error: {e}")
 def plot_lme_results(results_df, show_insignificant=False):
     if results_df is None or results_df.empty:
         return go.Figure(layout_title_text="No model results to plot.")
