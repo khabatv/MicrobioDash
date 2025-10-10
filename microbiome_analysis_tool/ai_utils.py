@@ -1,26 +1,76 @@
 
 import json
+import time
 import numpy as np
 import gzip
 from Bio import SeqIO
 import google.generativeai as genai
 from .config import logger, GEMINI_API_KEY
 
-# Attempt to configure the AI model
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    # Test connection with a very small request
-    test_response = model.generate_content("Test", generation_config={'max_output_tokens': 5})
-    if test_response and hasattr(test_response, 'text'):
-        logger.info("Gemini AI API configured and tested successfully.")
-        ai_available = True
-    else:
-        raise ValueError("Gemini API test failed.")
-except Exception as e:
-    logger.error(f"Could not configure or test Gemini AI API. AI features will be disabled. Error: {e}")
-    ai_available = False
-    model = None
+# Constants
+MAX_RETRIES = 3
+INITIAL_BACKOFF = 1  # seconds
+
+ai_available = False
+model = None
+
+def configure_ai():
+    global ai_available, model
+    if GEMINI_API_KEY == "YOUR_API_KEY_HERE":
+        logger.warning("Gemini AI API key is not configured. Please set the GEMINI_API_KEY environment variable.")
+        ai_available = False
+        model = None
+        return
+
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+
+        # Test connection with a very small request
+        test_response = model.generate_content("Test", generation_config={'max_output_tokens': 5})
+        if test_response and hasattr(test_response, 'text'):
+            logger.info("Gemini AI API configured and tested successfully.")
+            ai_available = True
+        else:
+            raise ValueError("Gemini API test failed.")
+    except Exception as e:
+        logger.error(f"Could not configure or test Gemini AI API. AI features will be disabled. Error: {e}")
+        ai_available = False
+        model = None
+
+configure_ai()
+
+def retry_with_exponential_backoff(func, *args, **kwargs):
+    """Retry a function with exponential backoff."""
+    retries = 0
+    while retries < MAX_RETRIES:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            retries += 1
+            wait_time = INITIAL_BACKOFF * (2 ** retries)
+            logger.warning(f"Attempt {retries} failed. Waiting {wait_time:.2f} seconds before retrying. Error: {e}")
+            time.sleep(wait_time)
+    logger.error(f"Function failed after {MAX_RETRIES} retries.")
+    return None
+
+def ai_generate_content(prompt, timeout=60):
+    """Helper function to generate content with error handling and timeout."""
+    global model, ai_available
+    if not ai_available or model is None:
+        logger.warning("Gemini AI API is not available.")
+        return None
+
+    try:
+        response = model.generate_content(prompt, request_options={'timeout': timeout})
+        if response and hasattr(response, 'text'):
+            return response.text
+        else:
+            logger.error(f"Gemini API returned an invalid response: {response}")
+            return None
+    except Exception as e:
+        logger.error(f"Error generating content with Gemini API: {e}", exc_info=True)
+        return None
 
 def ai_analyze_background(background):
     if not ai_available or not background:
@@ -38,8 +88,14 @@ def ai_analyze_background(background):
     }}
     """
     try:
-        response = model.generate_content(prompt)
-        return json.loads(response.text.replace("'", '"'))
+        response_text = retry_with_exponential_backoff(ai_generate_content, prompt)
+        if response_text:
+            return json.loads(response_text.replace("'", '"'))
+        else:
+            return None, []
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"AI background analysis failed: Invalid JSON: {e}")
+        return None, []
     except Exception as e:
         logger.error(f"AI background analysis failed: {e}")
         return None, []
@@ -66,8 +122,14 @@ def ai_analyze_quality_profiles(fnFs, fnRs):
     Return: {{'trunc_len_f': X, 'trunc_len_r': Y, 'max_ee': [A, B]}}
     """
     try:
-        response = model.generate_content(prompt)
-        return json.loads(response.text.replace("'", '"'))
+        response_text = retry_with_exponential_backoff(ai_generate_content, prompt)
+        if response_text:
+            return json.loads(response_text.replace("'", '"'))
+        else:
+            return None
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"AI quality profile analysis failed: Invalid JSON: {e}")
+        return None
     except Exception as e:
         logger.error(f"AI quality profile analysis failed: {e}")
         return None
@@ -82,8 +144,14 @@ def ai_analyze_prevalence(seqtab):
     Return a single value.
     """
     try:
-        response = model.generate_content(prompt)
-        return float(response.text.strip())
+        response_text = retry_with_exponential_backoff(ai_generate_content, prompt)
+        if response_text:
+            return float(response_text.strip())
+        else:
+            return None
+    except ValueError as e:
+        logger.error(f"AI prevalence analysis failed: Invalid value in response: {e}")
+        return None
     except Exception as e:
         logger.error(f"AI prevalence analysis failed: {e}")
         return None
@@ -97,8 +165,11 @@ def ai_analyze_metadata(metadata):
     Return a single column name.
     """
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        response_text = retry_with_exponential_backoff(ai_generate_content, prompt)
+        if response_text:
+            return response_text.strip()
+        else:
+            return None
     except Exception as e:
         logger.error(f"AI metadata analysis failed: {e}")
         return None
@@ -113,8 +184,14 @@ def ai_analyze_pca_pcoa(asv, ordination_scores):
     Return: {{'top_asvs': 'X,Y,Z', 'pval_threshold': A, 'contrib_threshold': B}}
     """
     try:
-        response = model.generate_content(prompt)
-        return json.loads(response.text.replace("'", '"'))
+        response_text = retry_with_exponential_backoff(ai_generate_content, prompt)
+        if response_text:
+            return json.loads(response_text.replace("'", '"'))
+        else:
+            return None
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"AI PCA/PCoA analysis failed: Invalid JSON: {e}")
+        return None
     except Exception as e:
         logger.error(f"AI PCA/PCoA analysis failed: {e}")
         return None
@@ -156,10 +233,12 @@ def ai_interpret_results(global_data, background, treatment_column_name):
 
         Based on this, generate a comprehensive report.
         """
-        response = model.generate_content(prompt, request_options={'timeout': 120})
-        return response.text if response and hasattr(response, 'text') else "AI interpretation failed to generate text."
+        response_text = retry_with_exponential_backoff(ai_generate_content, prompt, timeout=120)
+        if response_text:
+            return response_text
+        else:
+            return "AI interpretation failed to generate text."
 
     except Exception as e:
         logger.error(f"AI interpretation failed: {e}", exc_info=True)
         return f"AI interpretation failed due to an error: {e}"
-
