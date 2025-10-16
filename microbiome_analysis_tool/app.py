@@ -18,8 +18,8 @@ from .analysis import (
     perform_pcoa, perform_pca, perform_nmds, perform_pcoa_aitchison
 )
 from .statistics import (perform_pairwise_alpha_tests, run_permanova, run_differential_abundance, 
-                         run_indicator_species, run_mixed_effect_model, run_pymc_zinb_mixed_model)
-from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abundance_by_order, plot_abundance_by_taxlevel, 
+                         run_indicator_species, run_mixed_effect_model, run_pymc_zinb_mixed_model, run_ancom_skbio)
+from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abundance_by_order, plot_abundance_by_taxlevel, plot_ancom_clr_heatmap, 
                        plot_lme_results, format_lme_results_for_display)
 from .reporting import generate_pdf_report
 from .utils import fill_taxonomy_forward
@@ -72,6 +72,15 @@ app.layout = html.Div([
                 html.Label("Groups to Compare (subsetting):"), dcc.Dropdown(id='subset-groups-dropdown', multi=True, placeholder="Leave blank for all"),
                 html.Label("Top ASVs for PCA:"), dcc.Input(id='top-asvs', value=50, type='number'),
 
+html.Label("Differential abundance method:"),
+dcc.Dropdown(
+    id='da-method',
+    options=[
+        {'label': 'Kruskal–Wallis (current)', 'value': 'kw'},
+        {'label': 'ANCOM (Python, scikit-bio)', 'value': 'ancom'},
+    ],
+    value='kw',
+),
                 html.H4("Mixed-Effect Model"),
                 html.Label("Model Type:"),
                 dcc.Dropdown(id='model-type-dropdown', options=[
@@ -106,6 +115,8 @@ app.layout = html.Div([
                     dcc.Graph(id='abundance-genus-plot'),
                     html.H3("Statistical Comparisons"),
                     html.Div(id='differential-abundance-results'),
+                    html.H4("ANCOM – CLR heatmap (significant taxa)"),
+                    dcc.Graph(id='ancom-heatmap'),
                     html.Div(id='indicator-species-results'),
                     html.H3("Phylogenetic Tree"),
                     html.Div(id='phylogenetic-tree'),
@@ -196,35 +207,54 @@ def populate_subset_options(treat_col, n_sample, n_list, data_path):
         logger.error(f"Could not populate subsetting options: {e}", exc_info=True)
         return [], None, True
 @app.callback(
-    [Output('seq-depth-plot', 'figure'),
-     Output('alpha-diversity-plot', 'figure'),
-     Output('pcoa-plot', 'figure'),
-     Output('pcoa-aitchison-plot', 'figure'),
-     Output('pca-plot', 'figure'),
-     Output('nmds-plot', 'figure'),
-     Output('permanova-results', 'children'),
-     Output('abundance-order-plot', 'figure'),
-     Output('abundance-genus-plot', 'figure'),
-     Output('differential-abundance-results', 'children'),
-     Output('indicator-species-results', 'children'),
-     Output('phylogenetic-tree', 'children'),
-     Output('mixed-model-results', 'children'),
-     Output('mixed-model-plot', 'figure'),
-     Output('ai-interpretations', 'children'),
-     Output('output-files', 'children')],
+    [
+        Output('seq-depth-plot', 'figure'),
+        Output('alpha-diversity-plot', 'figure'),
+        Output('pcoa-plot', 'figure'),
+        Output('pcoa-aitchison-plot', 'figure'),
+        Output('pca-plot', 'figure'),
+        Output('nmds-plot', 'figure'),
+        Output('permanova-results', 'children'),
+        Output('abundance-order-plot', 'figure'),
+        Output('abundance-genus-plot', 'figure'),
+        Output('differential-abundance-results', 'children'),
+        Output('ancom-heatmap', 'figure'),
+        Output('indicator-species-results', 'children'),
+        Output('phylogenetic-tree', 'children'),
+        Output('mixed-model-results', 'children'),
+        Output('mixed-model-plot', 'figure'),
+        Output('ai-interpretations', 'children'),
+        Output('output-files', 'children'),
+    ],
     Input('run-analysis', 'n_clicks'),
-    [State('analysis-mode', 'value'), State('data-folder-path', 'value'), State('output-dir', 'value'),
-     State('trunc-len-f', 'value'), State('trunc-len-r', 'value'), State('max-ee', 'value'),
-     State('treatment-group', 'value'), State('subset-groups-dropdown', 'value'), State('top-asvs', 'value'),
-     State('background-info', 'value'), State('upload-silva', 'contents'), State('model-type-dropdown', 'value'),
-     State('mem-treatment-col', 'value'), State('time-col', 'value'), State('random-effect-cols', 'value'),
-     State('analysis-level-dropdown', 'value'), State('mem-top-n-features', 'value'),
-     State('mem-reference-group-input', 'value'), State('show-insignificant', 'value'), State('force_features', 'value')],
-    prevent_initial_call=True
+    [
+        State('analysis-mode', 'value'),
+        State('data-folder-path', 'value'),
+        State('output-dir', 'value'),
+        State('trunc-len-f', 'value'),
+        State('trunc-len-r', 'value'),
+        State('max-ee', 'value'),
+        State('treatment-group', 'value'),
+        State('subset-groups-dropdown', 'value'),
+        State('top-asvs', 'value'),
+        State('background-info', 'value'),
+        State('upload-silva', 'contents'),
+        State('model-type-dropdown', 'value'),
+        State('mem-treatment-col', 'value'),
+        State('time-col', 'value'),
+        State('random-effect-cols', 'value'),
+        State('analysis-level-dropdown', 'value'),
+        State('mem-top-n-features', 'value'),
+        State('mem-reference-group-input', 'value'),
+        State('show-insignificant', 'value'),
+        State('force_features', 'value'),
+        State('da-method', 'value'),   
+    ],
+    prevent_initial_call=True,
 )
 def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trunc_r, max_ee, treat_col,
                       subset, top_asvs, background, silva_content, model_type, mem_treat, time_col,
-                      rand_eff, analysis_lvl, mem_top_n, mem_ref, mem_show_insig, force_feat):
+                      rand_eff, analysis_lvl, mem_top_n, mem_ref, mem_show_insig, force_feat, da_method):
     if n_clicks == 0:
         empty_fig = go.Figure()
         empty_div = html.Div()
@@ -239,16 +269,21 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
             empty_fig,  # 8 abundance-order-plot
             empty_fig,  # 9 abundance-genus-plot
             empty_div,  # 10 differential-abundance-results
-            empty_div,  # 11 indicator-species-results
-            empty_div,  # 12 phylogenetic-tree
-            empty_div,  # 13 mixed-model-results
-            empty_fig,  # 14 mixed-model-plot
-            dcc.Markdown(),  # 15 ai-interpretations
-            empty_div   # 16 output-files
+            empty_fig,  # 11 ancom-heatmap.figure
+            empty_div,  # 12 indicator-species-results
+            empty_div,  # 13 phylogenetic-tree
+            empty_div,  # 14 mixed-model-results
+            empty_fig,  # 15 mixed-model-plot
+            "",         # 16 ai-interpretations
+            empty_div   # 17 output-files
         ]
 
     try:
-        global_data.clear() # Reset data for new run
+        # --- (Re)initialize run state ---
+        sample_mode = global_data.get('sample_data_mode', False)
+        global_data.clear()  # Reset data for new run
+        if sample_mode:
+            global_data['sample_data_mode'] = True
         os.makedirs(out_dir, exist_ok=True)
 
         # --- DATA LOADING ---
@@ -256,12 +291,19 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
 
         if use_sample_data:
             logger.info("Using internal sample data for analysis.")
-            seqtab, taxa_df, meta_df = sample_seqtab.copy(), sample_taxa.copy(), sample_metadata_df.copy()
+            seqtab, taxa_df, meta_df = (
+                sample_seqtab.copy(),
+                sample_taxa.copy(),
+                sample_metadata_df.copy(),
+            )
         else:
-            if not os.path.isdir(data_path): raise FileNotFoundError(f"Data folder '{data_path}' not found.")
+            if not os.path.isdir(data_path):
+                raise FileNotFoundError(f"Data folder '{data_path}' not found.")
             files = os.listdir(data_path)
+            # Add '.txt' here too if your metadata might be .txt
             meta_file = next((f for f in files if f.lower().endswith(('.csv', '.tsv'))), None)
-            if not meta_file: raise FileNotFoundError("Metadata file not found in data folder.")
+            if not meta_file:
+                raise FileNotFoundError("Metadata file not found in data folder.")
             meta_df = pd.read_csv(os.path.join(data_path, meta_file), index_col=0)
             meta_df.index = meta_df.index.astype(str)
 
@@ -279,7 +321,8 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                 if silva_content:
                     _, content_string = silva_content.split(',')
                     silva_path = os.path.join(out_dir, 'uploaded_silva.fasta')
-                    with open(silva_path, 'wb') as f: f.write(base64.b64decode(content_string))
+                    with open(silva_path, 'wb') as f:
+                        f.write(base64.b64decode(content_string))
                 taxa_df = assign_taxonomy(list(seqtab.columns), os.path.join(out_dir, 'asvs.fa'), silva_path, out_dir)
             else:  # ASV mode
                 logger.info("Starting analysis from pre-processed tables.")
@@ -287,10 +330,11 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                 taxa_path = os.path.join(out_dir, 'microbiome_ai_taxonomy.csv')
                 if not (os.path.exists(asv_path) and os.path.exists(taxa_path)):
                     raise FileNotFoundError("Run in FASTQ mode first to generate ASV/Taxonomy tables in the output directory.")
+                # If file is comma-separated despite .csv, change sep to ','
                 seqtab = pd.read_csv(asv_path, sep='\t', index_col=0, engine='python')
                 taxa_df = pd.read_csv(taxa_path, index_col=0)
 
-        # --- Normalize sample IDs so ASV table and metadata align (runs for both modes) ---
+        # --- Normalize sample IDs so ASV table and metadata align (both modes) ---
         seqtab.index = seqtab.index.map(lambda x: str(x).strip())
 
         if 'SampleID' in meta_df.columns:
@@ -326,7 +370,8 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         ps1_meta = calculate_alpha_diversity(ps1, treat_col)
         alpha_fig = px.violin(ps1_meta, x=treat_col, y='Shannon', box=True, points='all', title=f"Shannon Diversity by {treat_col}")
         stats_df = perform_pairwise_alpha_tests(ps1_meta, treat_col)
-        if not stats_df.empty: alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df)
+        if not stats_df.empty:
+            alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df)
         global_data['alpha_fig'] = alpha_fig
 
         # Beta Diversity & Ordinations
@@ -342,7 +387,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         )
         global_data['pcoa_fig'] = pcoa_fig
 
-        # NEW: Aitchison (CLR-Euclidean) PCoA
+        # Aitchison (CLR-Euclidean) PCoA
         pcoa_ait_scores, dm_ait, var_ait = perform_pcoa_aitchison(ps1, treat_col)
         var_vals = np.asarray(var_ait).ravel()  # robust to Series/array/list
         pc1_lbl = f"PC1 ({(var_vals[0]*100):.2f}%)" if len(var_vals) > 0 else "PC1"
@@ -357,6 +402,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                     pcoa_ait_scores.columns[1]: pc2_lbl}
         )
 
+        # NMDS
         nmds_scores, nmds_stress = perform_nmds(dm)
         nmds_fig = (
             px.scatter(
@@ -367,6 +413,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
             if nmds_scores is not None else go.Figure(layout_title_text="NMDS Failed")
         )
 
+        # PCA
         pca_res, pca_var = perform_pca(ps1['asv'], int(top_asvs))
         pca_df = pd.DataFrame(pca_res, columns=['PC1', 'PC2'], index=ps1['meta'].index).join(ps1['meta'][treat_col])
         pca_fig = px.scatter(
@@ -376,15 +423,67 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                     "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"}
         )
 
-        # Plots & Stats
+        # --- Plots & Stats ---
         seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
         global_data['seq_depth_fig'] = seq_depth_fig
+
         abund_order_fig = plot_abundance_by_order(ps1, treat_col)
         global_data['abundance_order_plot'] = abund_order_fig
+
         abund_genus_fig = plot_abundance_by_taxlevel(ps1, treat_col, tax_level="Genus", threshold=0.01)
         global_data['abundance_genus_plot'] = abund_genus_fig
 
-        diff_abund_res = run_differential_abundance(ps1, treat_col)
+        ancom_df = pd.DataFrame()  # default empty
+
+        if da_method == 'ancom':
+            try:
+                ancom_df = run_ancom_skbio(ps1, treat_col, alpha=0.05)
+
+                # robust: only filter if 'reject' exists and is True
+                if 'reject' in ancom_df.columns:
+                    sig = ancom_df[ancom_df['reject'] == True].copy()
+                else:
+                    sig = ancom_df.iloc[0:0].copy()  # empty
+
+                cols = ['Feature_ID', 'W', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
+                cols = [c for c in cols if c in sig.columns]
+
+                diff_abund_res = html.Div([
+                    html.H4("ANCOM (scikit-bio) significant features (reject = True)"),
+                    html.P(f"Grouping: {treat_col} | alpha = 0.05 | correction = Holm–Bonferroni"),
+                    html.Table(
+                        [html.Thead(html.Tr([html.Th(c) for c in cols]))] +
+                        [html.Tbody([
+                            html.Tr([html.Td(sig.iloc[i][c]) for c in cols])
+                            for i in range(min(50, len(sig)))
+                        ])]
+                    )
+                ])
+
+                out_path = os.path.join(out_dir, 'ancom_results.csv')
+                ancom_df.to_csv(out_path, index=False)
+
+            except Exception as e_ancom:
+                logger.error(f"ANCOM (skbio) failed: {e_ancom}", exc_info=True)
+                diff_abund_res = html.Div([
+                    html.H4("ANCOM (Python) failed"),
+                    html.Pre(str(e_ancom), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
+                ])
+        else:
+            diff_abund_res = run_differential_abundance(ps1, treat_col)
+
+        # Heatmap (guarded)
+        if not ancom_df.empty:
+            ancom_heatmap_fig = plot_ancom_clr_heatmap(ancom_df, tax_level_cols=('Genus', 'Species'), top_k=30)
+        else:
+            ancom_heatmap_fig = go.Figure()
+            ancom_heatmap_fig.update_layout(
+                title="ANCOM heatmap (run with DA method = 'ANCOM' to populate)",
+                xaxis_title="Treatment",
+                yaxis_title="Feature"
+            )
+
+        # Indicator species & tree
         indic_spec_res, indic_df = run_indicator_species(ps1, treat_col)
         tree_img = plot_phylogenetic_tree(seqtab, taxa_filled, indic_df)
         global_data['tree_img'] = tree_img
@@ -394,7 +493,10 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
             lme_res_df = run_pymc_zinb_mixed_model(ps1, mem_treat, rand_eff, time_col, analysis_lvl, mem_top_n, mem_ref, force_feat)
         else:
             lme_res_df = run_mixed_effect_model(ps1, mem_treat, rand_eff, time_col, analysis_lvl, mem_top_n, mem_ref, force_feat)
-        mix_model_res = format_lme_results_for_display(lme_res_df, ps1, mem_treat, time_col, mem_ref, mem_show_insig, force_feat)
+
+        mix_model_res = format_lme_results_for_display(
+            lme_res_df, ps1, mem_treat, time_col, mem_ref, mem_show_insig, force_feat
+        )
         mix_model_plot = plot_lme_results(lme_res_df, mem_show_insig)
 
         # AI Interpretation & Outputs
@@ -405,37 +507,56 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         out_files = html.Div([html.P(f) for f in os.listdir(out_dir) if f.endswith('.csv')])
 
         logger.info("Analysis completed successfully.")
+
+        # SUCCESS: 17 outputs in declared order
         return (
-            seq_depth_fig, alpha_fig, pcoa_fig, pcoa_ait_fig, pca_fig, nmds_fig, permanova_res,
-            abund_order_fig, abund_genus_fig,
-            diff_abund_res, indic_spec_res,
-            html.Img(src=tree_img, style={'width': '100%'}) if tree_img else html.P("Tree could not be generated."),
-            mix_model_res, mix_model_plot, dcc.Markdown(ai_interp), out_files
+            seq_depth_fig,        # 1  seq-depth-plot.figure
+            alpha_fig,            # 2  alpha-diversity-plot.figure
+            pcoa_fig,             # 3  pcoa-plot.figure
+            pcoa_ait_fig,         # 4  pcoa-aitchison-plot.figure
+            pca_fig,              # 5  pca-plot.figure
+            nmds_fig,             # 6  nmds-plot.figure
+            permanova_res,        # 7  permanova-results.children
+            abund_order_fig,      # 8  abundance-order-plot.figure
+            abund_genus_fig,      # 9  abundance-genus-plot.figure
+            diff_abund_res,       # 10 differential-abundance-results.children
+            ancom_heatmap_fig,    # 11 ancom-heatmap.figure
+            indic_spec_res,       # 12 indicator-species-results.children
+            (html.Img(src=tree_img, style={'width': '100%'})
+             if tree_img else html.P("Tree could not be generated.")),  # 13 phylogenetic-tree.children
+            mix_model_res,        # 14 mixed-model-results.children
+            mix_model_plot,       # 15 mixed-model-plot.figure
+            ai_interp,            # 16 ai-interpretations.children
+            out_files             # 17 output-files.children
         )
 
     except Exception as e:
         logger.error(f"Error during analysis: {e}", exc_info=True)
         error_fig = go.Figure(layout_title_text=f"Error: {e}")
-        error_msg = html.Div([html.H4("Analysis Failed"), html.P(f"Details: {e}")],
-                             style={'color': 'red', 'fontWeight': 'bold'})
-        return [
-            error_fig,  # 1 seq-depth-plot
-            error_fig,  # 2 alpha-diversity-plot
-            error_fig,  # 3 pcoa-plot
-            error_fig,  # 4 pcoa-aitchison-plot
-            error_fig,  # 5 pca-plot
-            error_fig,  # 6 nmds-plot
-            error_msg,  # 7 permanova-results
-            error_fig,  # 8 abundance-order-plot
-            error_fig,  # 9 abundance-genus-plot
-            error_msg,  # 10 differential-abundance-results
-            error_msg,  # 11 indicator-species-results
-            error_msg,  # 12 phylogenetic-tree
-            error_msg,  # 13 mixed-model-results
-            error_fig,  # 14 mixed-model-plot
-            dcc.Markdown(f"### Error\n{e}"),  # 15 ai-interpretations
-            error_msg   # 16 output-files
-        ]
+        error_msg = html.Div(
+            [html.H4("Analysis Failed"), html.P(f"Details: {e}")],
+            style={'color': 'red', 'fontWeight': 'bold'}
+        )
+        # ERROR: 17 outputs in declared order
+        return (
+            error_fig,  # 1  seq-depth-plot.figure
+            error_fig,  # 2  alpha-diversity-plot.figure
+            error_fig,  # 3  pcoa-plot.figure
+            error_fig,  # 4  pcoa-aitchison-plot.figure
+            error_fig,  # 5  pca-plot.figure
+            error_fig,  # 6  nmds-plot.figure
+            error_msg,  # 7  permanova-results.children
+            error_fig,  # 8  abundance-order-plot.figure
+            error_fig,  # 9  abundance-genus-plot.figure
+            error_msg,  # 10 differential-abundance-results.children
+            error_fig,  # 11 ancom-heatmap.figure
+            error_msg,  # 12 indicator-species-results.children
+            error_msg,  # 13 phylogenetic-tree.children
+            error_msg,  # 14 mixed-model-results.children
+            error_fig,  # 15 mixed-model-plot.figure
+            f"### Error\n{e}",  # 16 ai-interpretations.children
+            error_msg   # 17 output-files.children
+        )
 
 @app.callback(
     Output('download-report', 'data'),
@@ -446,7 +567,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
 )
 def download_pdf_report(n_clicks, output_dir, interpretations_md):
     if n_clicks > 0:
-        interpretations = interpretations_md['props']['children'] if interpretations_md and 'props' in interpretations_md else "No interpretation generated."
+        interpretations = interpretations_md or "No interpretation generated."
         report_path = generate_pdf_report(global_data, interpretations, output_dir)
         if report_path:
             return dcc.send_file(report_path)

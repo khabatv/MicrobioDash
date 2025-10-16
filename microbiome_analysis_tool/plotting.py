@@ -173,6 +173,52 @@ def plot_abundance_by_taxlevel(ps1_object, treatment_column, tax_level="Genus", 
     except Exception as e:
         logger.error(f"Could not generate {tax_level}-level abundance plot: {e}", exc_info=True)
         return go.Figure(layout_title_text=f"Error: {e}")
+def plot_ancom_clr_heatmap(ancom_df, tax_level_cols=('Genus','Species'), top_k=30):
+    """
+    ancom_df: output of run_ancom_skbio() that contains
+      - 'W', 'reject'
+      - one column per treatment named 'CLR_mean::<treatment>'
+      - taxonomy columns (optional)
+    tax_level_cols: tuple/list of taxonomy columns to build a display label
+    top_k: number of features to show (ordered by W)
+
+    Returns: a Plotly Figure (heatmap)
+    """
+    if ancom_df is None or ancom_df.empty:
+        return px.imshow(np.zeros((1,1)), labels=dict(color="CLR mean"), title="No ANCOM results")
+
+    # keep only significant & top by W
+    cols_clr = [c for c in ancom_df.columns if c.startswith('CLR_mean::')]
+    df = ancom_df.copy()
+    df_sig = df[df['reject']].sort_values('W', ascending=False).head(top_k)
+
+    if df_sig.empty or not cols_clr:
+        return px.imshow(np.zeros((1,1)), labels=dict(color="CLR mean"), title="No significant features")
+
+    # display label: prefer requested taxonomy level(s), fallback to ASV id
+    def _label(row):
+        parts = [str(row[c]) for c in tax_level_cols if c in row and pd.notna(row[c]) and str(row[c]).strip()]
+        return " ".join(parts) if parts else row.get('ASV', row.get('Feature_ID'))
+
+    df_sig = df_sig.assign(Display=df_sig.apply(_label, axis=1))
+
+    # long → wide (features × groups)
+    wide = df_sig.set_index('Display')[cols_clr]
+    # a nicer group name without prefix
+    wide.columns = [c.replace('CLR_mean::','') for c in wide.columns]
+
+    # sort rows by which group is highest (optional)
+    wide = wide.loc[wide.apply(np.argmax, axis=1).sort_values().index]
+
+    fig = px.imshow(
+        wide,
+        color_continuous_midpoint=0,
+        aspect='auto',
+        labels=dict(color="CLR mean (log)"),
+        title=f"ANCOM: Per-group CLR mean (top {len(wide)} features)"
+    )
+    fig.update_layout(margin=dict(l=60, r=10, t=40, b=40))
+    return fig
 def plot_lme_results(results_df, show_insignificant=False):
     if results_df is None or results_df.empty:
         return go.Figure(layout_title_text="No model results to plot.")

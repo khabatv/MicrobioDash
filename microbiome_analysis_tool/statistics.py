@@ -1,19 +1,41 @@
 
 import pandas as pd
 import numpy as np
+# --- Compatibility shim for NumPy < 2.0 (scikit-bio expects np.isdtype) ---
+if not hasattr(np, "isdtype"):
+    def _np_isdtype(dt, kind):
+        try:
+            dt = np.dtype(dt)
+        except Exception:
+            return False
+        if kind in ("numeric", "number"):
+            return np.issubdtype(dt, np.number)
+        if kind == "bool":
+            return np.issubdtype(dt, np.bool_)
+        if kind == "integer":
+            return np.issubdtype(dt, np.integer)
+        if kind in ("floating", "float"):
+            return np.issubdtype(dt, np.floating)
+        # fallback: best-effort False
+        return False
+    np.isdtype = _np_isdtype
 import scikit_posthocs as sp
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
-import pymc as pm
-import arviz as az
-import patsy
-import pytensor.tensor as pt
+try:
+    import pymc as pm
+    import arviz as az
+    _PYMC_AVAILABLE = True
+except Exception:  # ImportError is fine, but this catches env issues too
+    pm = None
+    az = None
+    _PYMC_AVAILABLE = False
 from itertools import combinations
 from scipy.stats import kruskal, mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 from skbio.stats.distance import permanova
+from skbio.stats.composition import ancom
 from dash import html
-from joblib import Parallel, delayed
 from .config import logger, CPU_CORES
 
 def perform_pairwise_alpha_tests(alpha_df, treatment_col, p_adjust_method='fdr_bh'):
@@ -159,7 +181,127 @@ def run_indicator_species(ps1_object, treatment_column, n_permutations=999):
     except Exception as e:
         logger.error(f"Indicator Species Analysis failed: {e}", exc_info=True)
         return html.P("Error during Indicator Species Analysis."), pd.DataFrame()
+def _ancom_direction(tbl_samples_x_features: pd.DataFrame, groups: pd.Series) -> pd.DataFrame:
+    """
+    Infer direction by CLR means per group: for each feature, which group is highest/lowest.
+    Assumes tbl already has a small pseudocount added.
+    """
+    # CLR transform
+    gm = np.exp(np.log(tbl_samples_x_features).mean(axis=1))  # geometric mean per sample
+    clr = np.log(tbl_samples_x_features.div(gm, axis=0))
 
+    # Average per group
+    clr_means = clr.groupby(groups).mean()
+    top = clr_means.idxmax(axis=0)
+    bottom = clr_means.idxmin(axis=0)
+    return pd.DataFrame({"group_highest": top, "group_lowest": bottom})
+
+
+def run_ancom_skbio(ps, group_col, alpha=0.05, zero_pseudocount=1, add_clr_means=True):
+    """
+    Run ANCOM (scikit-bio) and return a table with:
+      - Feature_ID, W, reject
+      - group_highest / group_lowest (based on CLR means)
+      - One column per treatment level with the CLR group mean (if add_clr_means=True)
+      - (optional) taxonomy columns merged if available in ps['tax'].
+
+    Notes:
+      * ANCOM uses log-ratios internally; per-group columns are **CLR means** (log scale).
+      * Higher CLR mean ~ relatively more abundant.
+    """
+    # ------- Prepare data: samples x features
+    tbl = ps['asv'].T.copy()           # samples x features
+    meta = ps['meta'].copy()
+
+    # Align and validate grouping column
+    meta = meta.loc[meta.index.intersection(tbl.index)]
+    if group_col not in meta.columns:
+        return pd.DataFrame(columns=['Feature_ID', 'W', 'reject', 'alpha'])
+    meta = meta[~meta[group_col].isna()]
+    tbl  = tbl.loc[meta.index]
+    grp  = meta[group_col].astype('category')
+
+    if grp.nunique() < 2:
+        return pd.DataFrame(columns=['Feature_ID', 'W', 'reject', 'alpha'])
+
+    # Pseudocount → avoid log(0)
+    if zero_pseudocount and zero_pseudocount > 0:
+        tbl = tbl + zero_pseudocount
+
+    # Drop constant (no variability) features
+    const_cols = tbl.columns[(tbl.nunique(dropna=False) <= 1)]
+    if len(const_cols):
+        tbl = tbl.drop(columns=const_cols)
+
+    if tbl.shape[1] == 0:
+        return pd.DataFrame(columns=['Feature_ID', 'W', 'reject', 'alpha'])
+
+    # ------- Compute CLR (for interpretation & per-group means)
+    # CLR(x) = log(x) - mean(log(x)) per sample
+    log_tbl = np.log(tbl)
+    clr_tbl = log_tbl.sub(log_tbl.mean(axis=1), axis=0)  # samples x features
+
+    # Group-wise CLR means (features x groups)
+    # These are the values you can plot later
+    group_means = clr_tbl.groupby(grp).mean().T  # index: features, columns: groups
+
+    # Highest / lowest group per feature (by CLR mean)
+    group_highest = group_means.idxmax(axis=1)
+    group_lowest  = group_means.idxmin(axis=1)
+
+    # ------- Run ANCOM
+    rejections, W = ancom(tbl, grouping=grp, alpha=alpha, p_adjust='holm')
+
+    # Normalize outputs to 1-D Series with feature index
+    feature_index = tbl.columns
+
+    def _ensure_series(x, default_index):
+        if isinstance(x, pd.Series):
+            return x.reindex(default_index)
+        if isinstance(x, pd.DataFrame):
+            # try common names, else first column
+            for c in ('reject', 'W'):
+                if c in x.columns:
+                    return x[c].reindex(default_index)
+            if x.shape[1] >= 1:
+                return x.iloc[:, 0].reindex(default_index)
+            return pd.Series(index=default_index, dtype=float)
+        arr = np.asarray(x).ravel()
+        if arr.shape[0] != len(default_index):
+            arr = arr[:len(default_index)]
+        return pd.Series(arr, index=default_index)
+
+    rej  = _ensure_series(rejections, feature_index)
+    Wser = _ensure_series(W,          feature_index)
+
+    # ------- Build result table
+    res = pd.DataFrame({
+        'Feature_ID': feature_index,
+        'W':          Wser.values,
+        'reject':     rej.values.astype(bool),
+        'group_highest': group_highest.reindex(feature_index).values,
+        'group_lowest':  group_lowest.reindex(feature_index).values,
+    })
+
+    # Add compact ASV IDs
+    res.insert(0, "ASV", [f"ASV_{i+1:03d}" for i in range(len(res))])
+
+    # Merge taxonomy if present
+    tax = ps.get('tax')
+    if isinstance(tax, pd.DataFrame):
+        res = res.merge(tax, left_on='Feature_ID', right_index=True, how='left')
+
+    # Append per-group CLR means (one column per treatment)
+    if add_clr_means:
+        gm = group_means.copy()
+        # Make nice, unique column names: e.g. CLR_mean::<GroupName>
+        gm.columns = [f"CLR_mean::{str(c)}" for c in gm.columns]
+        res = res.merge(gm, left_on='Feature_ID', right_index=True, how='left')
+
+    res['alpha'] = alpha
+    res = res.sort_values('W', ascending=False).reset_index(drop=True)
+
+    return res
 def run_mixed_effect_model(ps1_object, treatment_col, random_effect_cols, time_col,
                    analysis_level, top_n_features=20, reference_group=None, force_features=None):
     logger.info(f"Running Negative Binomial GEE at the {analysis_level} level...")
@@ -221,8 +363,14 @@ def run_mixed_effect_model(ps1_object, treatment_col, random_effect_cols, time_c
         logger.error(f"CRITICAL ERROR in mixed-effect model: {e}", exc_info=True)
         return pd.DataFrame()
 
-def run_pymc_zinb_mixed_model(*args, **kwargs):
-    logger.warning("Bayesian ZINB model is a placeholder in this version and has not been run.")
+def run_pymc_zinb_mixed_model(ps, mem_treat, rand_eff, time_col, analysis_lvl, mem_top_n, mem_ref, force_feat):
+    if not _PYMC_AVAILABLE:
+        raise RuntimeError(
+            "PyMC is not available in this environment. "
+            "Switch the 'Model Type' to 'GEE' in the UI, "
+            "or install the optional dependencies: "
+            "pip install 'pymc>=5' 'arviz>=0.16' 'cachetools>=5'"
+        )
     # In a real scenario, the full PyMC implementation would go here.
     # For now, we return an empty DataFrame to prevent errors.
     return pd.DataFrame()
