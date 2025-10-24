@@ -24,6 +24,7 @@ from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abunda
 from .reporting import generate_pdf_report
 from .utils import fill_taxonomy_forward
 from dash import no_update
+from .plotting import apply_pub_style, get_pub_palette
 # --- Initialize Dash App ---
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
@@ -103,6 +104,7 @@ dcc.Dropdown(
             dcc.Loading(id="loading-results", type="default", children=[
                 html.Div(id='results-output', children=[
                     html.H3("Sequencing Depth"), dcc.Graph(id='seq-depth-plot'),
+                    html.H3("Total Reads by Group"), dcc.Graph(id='total-reads-plot'),
                     html.H3("Alpha Diversity"), dcc.Graph(id='alpha-diversity-plot'),
                     html.H3("Beta Diversity & Ordination"),
                     html.Div(id='permanova-results', style={'textAlign': 'center'}),
@@ -138,6 +140,25 @@ dcc.Dropdown(
     ])
 ])
 
+def _infer_group_order(meta_df: pd.DataFrame, treat_col: str) -> list:
+    s = meta_df[treat_col]
+
+    # (a) ordered Categorical in metadata → use categories
+    if pd.api.types.is_categorical_dtype(s) and getattr(s.cat, "ordered", False):
+        return list(s.cat.categories)
+
+    # (b) look for a numeric “order” column per sample, then sort groups by its min
+    for c in [f"{treat_col}_order", "PlotOrder", "GroupOrder", "order", "Order", "Run", "Day", "Time"]:
+        if c in meta_df.columns:
+            ords = pd.to_numeric(meta_df[c], errors="coerce")
+            if ords.notna().any():
+                return (meta_df.assign(__ord=ords)
+                               .groupby(treat_col)["__ord"].min()
+                               .sort_values()
+                               .index.tolist())
+
+    # (c) fallback: first-seen order in metadata
+    return list(dict.fromkeys(s.astype(str).tolist()))
 # --- Callbacks ---
 
 @app.callback(
@@ -209,6 +230,7 @@ def populate_subset_options(treat_col, n_sample, n_list, data_path):
 @app.callback(
     [
         Output('seq-depth-plot', 'figure'),
+        Output('total-reads-plot', 'figure'),
         Output('alpha-diversity-plot', 'figure'),
         Output('pcoa-plot', 'figure'),
         Output('pcoa-aitchison-plot', 'figure'),
@@ -260,6 +282,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         empty_div = html.Div()
         return [
             empty_fig,  # 1 seq-depth-plot
+            empty_fig,
             empty_fig,  # 2 alpha-diversity-plot
             empty_fig,  # 3 pcoa-plot
             empty_fig,  # 4 pcoa-aitchison-plot
@@ -363,74 +386,183 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         ps1 = ps1_full
         if subset:
             meta_subset = ps1_full['meta'][ps1_full['meta'][treat_col].isin(subset)]
-            ps1 = {'asv': ps1_full['asv'].loc[:, meta_subset.index], 'tax': ps1_full['tax'], 'meta': meta_subset}
+            ps1 = {
+                'asv': ps1_full['asv'].loc[:, meta_subset.index],
+                'tax': ps1_full['tax'],
+                'meta': meta_subset
+            }
         global_data['ps1'] = ps1
 
-        # Alpha Diversity
+               # ---- Consistent group order (from metadata) ----
+        group_order = _infer_group_order(ps1['meta'], treat_col)
+        ps1['meta'][treat_col] = pd.Categorical(
+            ps1['meta'][treat_col], categories=group_order, ordered=True
+        )
+        global_data['group_order'] = group_order
+
+        # palette for groups
+        palette_groups = get_pub_palette(len(group_order))
+        # --- Total reads per treatment group (sum) ---
+        reads_per_sample = seqtab.sum(axis=1).rename("Reads")
+        reads_by_group = (
+     reads_per_sample
+     .to_frame()
+     .join(ps1['meta'][[treat_col]])
+     .groupby(treat_col, dropna=True)["Reads"]
+     .sum()
+     .reset_index()
+ )
+
+ # keep same order as everywhere else
+        order_for_reads = [g for g in group_order if g in reads_by_group[treat_col].unique()]
+
+        total_reads_fig = px.bar(
+     reads_by_group,
+     x=treat_col, y="Reads",
+     category_orders={treat_col: order_for_reads},
+     text="Reads"
+ )
+        total_reads_fig.update_traces(texttemplate="%{text:,}", textposition="outside", cliponaxis=False)
+        total_reads_fig.update_layout(
+     title="Total Reads per Treatment Group",
+     xaxis_title=treat_col,
+     yaxis_title="Total reads",
+     showlegend=False,
+     width=900, height=700,
+     margin=dict(l=80, r=40, t=60, b=100),
+ )
+        total_reads_fig.update_yaxes(tickformat=",")
+        apply_pub_style(total_reads_fig, portrait=True, base_font=16)
+
+
+        # ---- Alpha Diversity (respect group order) ----
         ps1_meta = calculate_alpha_diversity(ps1, treat_col)
-        alpha_fig = px.violin(ps1_meta, x=treat_col, y='Shannon', box=True, points='all', title=f"Shannon Diversity by {treat_col}")
+        ps1_meta[treat_col] = pd.Categorical(
+            ps1_meta[treat_col], categories=group_order, ordered=True
+        )
+
+        alpha_fig = px.violin(
+            ps1_meta,
+            x=treat_col,
+            y='Shannon',
+            box=True,
+            points='all',
+            title=f"Shannon Diversity by {treat_col}",
+            category_orders={treat_col: group_order},
+            color=treat_col,
+            color_discrete_sequence=palette_groups,
+        )
+        alpha_fig.update_xaxes(categoryorder="array", categoryarray=group_order)
+        apply_pub_style(alpha_fig, portrait=True, base_font=16)
+
         stats_df = perform_pairwise_alpha_tests(ps1_meta, treat_col)
         if not stats_df.empty:
-            alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df)
+            try:
+                alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df, group_order=group_order)
+            except TypeError:
+                alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df)
+
         global_data['alpha_fig'] = alpha_fig
 
-        # Beta Diversity & Ordinations
+        # ---- Beta Diversity & Ordinations ----
         asv_rel, meta_rel = calculate_beta_diversity(ps1)
         pcoa_scores, dm, pcoa_var = perform_pcoa(asv_rel, meta_rel, treat_col)
         global_data['pcoa_scores'] = pcoa_scores
         permanova_res = run_permanova(dm, meta_rel, treat_col)
+
         pcoa_fig = px.scatter(
-            pcoa_scores, x='PC1', y='PC2', color=treat_col,
+            pcoa_scores,
+            x='PC1', y='PC2',
+            color=treat_col,
             title="PCoA (Bray-Curtis)",
             labels={"PC1": f"PC1 ({pcoa_var['PC1']*100:.2f}%)",
-                    "PC2": f"PC2 ({pcoa_var['PC2']*100:.2f}%)"}
+                    "PC2": f"PC2 ({pcoa_var['PC2']*100:.2f}%)"},
+            category_orders={treat_col: group_order},
+            color_discrete_sequence=palette_groups,
         )
+        apply_pub_style(pcoa_fig, portrait=True, base_font=16)
         global_data['pcoa_fig'] = pcoa_fig
 
         # Aitchison (CLR-Euclidean) PCoA
         pcoa_ait_scores, dm_ait, var_ait = perform_pcoa_aitchison(ps1, treat_col)
-        var_vals = np.asarray(var_ait).ravel()  # robust to Series/array/list
+        var_vals = np.asarray(var_ait).ravel()
         pc1_lbl = f"PC1 ({(var_vals[0]*100):.2f}%)" if len(var_vals) > 0 else "PC1"
         pc2_lbl = f"PC2 ({(var_vals[1]*100):.2f}%)" if len(var_vals) > 1 else "PC2"
+
         pcoa_ait_fig = px.scatter(
             pcoa_ait_scores,
-            x=pcoa_ait_scores.columns[0],
-            y=pcoa_ait_scores.columns[1],
+            x=pcoa_ait_scores.columns[0], y=pcoa_ait_scores.columns[1],
             color=treat_col,
             title="PCoA (Aitchison / CLR-Euclidean)",
             labels={pcoa_ait_scores.columns[0]: pc1_lbl,
-                    pcoa_ait_scores.columns[1]: pc2_lbl}
+                    pcoa_ait_scores.columns[1]: pc2_lbl},
+            category_orders={treat_col: group_order},
+            color_discrete_sequence=palette_groups,
         )
+        apply_pub_style(pcoa_ait_fig, portrait=True, base_font=16)
 
-        # NMDS
-        nmds_scores, nmds_stress = perform_nmds(dm)
-        nmds_fig = (
-            px.scatter(
-                nmds_scores.join(ps1['meta'][[treat_col]]),
-                x='NMDS1', y='NMDS2', color=treat_col,
-                title=f"NMDS (Stress: {nmds_stress:.4f})"
+        # ---- NMDS (robust) ----
+        nmds_scores, nmds_stress = (None, None)
+        try:
+            nmds_scores, nmds_stress = perform_nmds(dm)
+        except Exception as e_nmds:
+            logger.warning(f"NMDS failed: {e_nmds}")
+
+        if nmds_scores is not None:
+            nmds_plot_df = nmds_scores.join(ps1['meta'][[treat_col]])
+            nmds_plot_df[treat_col] = pd.Categorical(
+                nmds_plot_df[treat_col], categories=group_order, ordered=True
             )
-            if nmds_scores is not None else go.Figure(layout_title_text="NMDS Failed")
-        )
+            nmds_fig = px.scatter(
+                nmds_plot_df, x='NMDS1', y='NMDS2', color=treat_col,
+                title=f"NMDS (Stress: {nmds_stress:.4f})",
+                category_orders={treat_col: group_order},
+                color_discrete_sequence=palette_groups,
+            )
+            apply_pub_style(nmds_fig, portrait=True, base_font=16)
+        else:
+            nmds_fig = go.Figure(layout_title_text="NMDS Failed")
+            apply_pub_style(nmds_fig, portrait=True, base_font=16)
 
-        # PCA
+        # ---- PCA ----
         pca_res, pca_var = perform_pca(ps1['asv'], int(top_asvs))
-        pca_df = pd.DataFrame(pca_res, columns=['PC1', 'PC2'], index=ps1['meta'].index).join(ps1['meta'][treat_col])
+        pca_df = (
+            pd.DataFrame(pca_res, columns=['PC1', 'PC2'], index=ps1['meta'].index)
+              .join(ps1['meta'][treat_col])
+        )
+        pca_df[treat_col] = pd.Categorical(pca_df[treat_col], categories=group_order, ordered=True)
+
         pca_fig = px.scatter(
             pca_df, x='PC1', y='PC2', color=treat_col,
             title=f"PCA (Top {top_asvs} ASVs)",
             labels={"PC1": f"PC1 ({pca_var[0]*100:.2f}%)",
-                    "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"}
+                    "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"},
+            category_orders={treat_col: group_order},
+            color_discrete_sequence=palette_groups,
         )
+        apply_pub_style(pca_fig, portrait=True, base_font=16)
 
         # --- Plots & Stats ---
         seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
+        apply_pub_style(seq_depth_fig, portrait=True, base_font=16)
         global_data['seq_depth_fig'] = seq_depth_fig
+        
 
-        abund_order_fig = plot_abundance_by_order(ps1, treat_col)
+        # Abundance plots (guard if functions don't accept group_order)
+        try:
+            abund_order_fig = plot_abundance_by_order(ps1, treat_col, group_order=group_order)
+        except TypeError:
+            abund_order_fig = plot_abundance_by_order(ps1, treat_col)
         global_data['abundance_order_plot'] = abund_order_fig
 
-        abund_genus_fig = plot_abundance_by_taxlevel(ps1, treat_col, tax_level="Genus", threshold=0.01)
+        try:
+            abund_genus_fig = plot_abundance_by_taxlevel(
+                ps1, treat_col, tax_level="Genus", threshold=0.01, group_order=group_order
+            )
+        except TypeError:
+            abund_genus_fig = plot_abundance_by_taxlevel(
+                ps1, treat_col, tax_level="Genus", threshold=0.01
+            )
         global_data['abundance_genus_plot'] = abund_genus_fig
 
         ancom_df = pd.DataFrame()  # default empty
@@ -443,7 +575,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                 if 'reject' in ancom_df.columns:
                     sig = ancom_df[ancom_df['reject'] == True].copy()
                 else:
-                    sig = ancom_df.iloc[0:0].copy()  # empty
+                    sig = ancom_df.iloc[0:0].copy()
 
                 cols = ['Feature_ID', 'W', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
                 cols = [c for c in cols if c in sig.columns]
@@ -472,21 +604,88 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         else:
             diff_abund_res = run_differential_abundance(ps1, treat_col)
 
-        # Heatmap (guarded)
+        # ---- Heatmap (guarded) ----
         if not ancom_df.empty:
-            ancom_heatmap_fig = plot_ancom_clr_heatmap(ancom_df, tax_level_cols=('Genus', 'Species'), top_k=30)
+            try:
+                ancom_heatmap_fig = plot_ancom_clr_heatmap(
+                    ancom_df,
+                    top_k=None,          # show ALL passing features
+                    clr_threshold=1.0,   # require CLR mean > 1 in ≥1 group
+                    w_threshold=1,       # require W > 1
+                    short_id_col='ASV',
+                    label_with_genus=True,
+                    group_order=group_order,  # only used if function supports it
+                )
+            except TypeError:
+                # older signature without group_order
+                ancom_heatmap_fig = plot_ancom_clr_heatmap(
+                    ancom_df,
+                    top_k=None,
+                    clr_threshold=1.0,
+                    w_threshold=1,
+                    short_id_col='ASV',
+                    label_with_genus=True,
+                )
+            apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
         else:
             ancom_heatmap_fig = go.Figure()
             ancom_heatmap_fig.update_layout(
                 title="ANCOM heatmap (run with DA method = 'ANCOM' to populate)",
                 xaxis_title="Treatment",
-                yaxis_title="Feature"
+                yaxis_title="Feature",
             )
+            apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
+# ---------------- Indicator species & tree (robust) ----------------
+        indic_spec_res = html.Div([html.H4("Indicator species"), html.P("No results computed.")])
+        indic_df = pd.DataFrame()
+        tree_img = None
 
-        # Indicator species & tree
-        indic_spec_res, indic_df = run_indicator_species(ps1, treat_col)
-        tree_img = plot_phylogenetic_tree(seqtab, taxa_filled, indic_df)
-        global_data['tree_img'] = tree_img
+        try:
+            # Preflight checks for grouping
+            if treat_col not in ps1['meta'].columns:
+                raise ValueError(f"Treatment column '{treat_col}' not found in metadata.")
+        
+            meta_ok = ps1['meta'].copy()
+            meta_ok = meta_ok[meta_ok[treat_col].notna()]
+            if meta_ok.empty:
+                raise ValueError(f"No non-NA values in '{treat_col}' after filtering/subsetting.")
+
+    # Need ≥ 2 groups with ≥ 2 samples each
+            counts = meta_ok[treat_col].value_counts()
+            valid_groups = counts[counts >= 2].index.tolist()
+            if len(valid_groups) < 2:
+                raise ValueError(
+                    "Indicator species needs ≥ 2 groups with ≥ 2 samples each. "
+                    f"Group sizes: {counts.to_dict()}"
+                )
+
+    # Subset ps1 consistently to valid samples
+            valid_samples = meta_ok.index.tolist()
+            ps1_clean = {
+                'asv' : ps1['asv'].loc[:, valid_samples],
+                'tax' : ps1['tax'],
+                'meta': ps1['meta'].loc[valid_samples]
+            }
+
+    # Run indicator species on the clean object
+            indic_spec_res, indic_df = run_indicator_species(ps1_clean, treat_col)
+
+        except Exception as e_indic:
+            logger.error(f"Indicator species failed: {e_indic}", exc_info=True)
+            indic_spec_res = html.Div([
+                html.H4("Indicator species"),
+                html.P("Computation failed."),
+                html.Pre(str(e_indic), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
+            ])
+
+# Tree: try to draw even if indicator step failed
+        try:
+            tree_img = plot_phylogenetic_tree(seqtab, taxa_filled, indic_df if not indic_df.empty else None)
+            global_data['tree_img'] = tree_img
+        except Exception as e_tree:
+            logger.error(f"Tree plotting failed: {e_tree}", exc_info=True)
+            tree_img = None
+
 
         # Mixed Models
         if model_type == 'pymc_zinb':
@@ -511,6 +710,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         # SUCCESS: 17 outputs in declared order
         return (
             seq_depth_fig,        # 1  seq-depth-plot.figure
+            total_reads_fig,
             alpha_fig,            # 2  alpha-diversity-plot.figure
             pcoa_fig,             # 3  pcoa-plot.figure
             pcoa_ait_fig,         # 4  pcoa-aitchison-plot.figure
@@ -540,6 +740,7 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         # ERROR: 17 outputs in declared order
         return (
             error_fig,  # 1  seq-depth-plot.figure
+            error_fig,
             error_fig,  # 2  alpha-diversity-plot.figure
             error_fig,  # 3  pcoa-plot.figure
             error_fig,  # 4  pcoa-aitchison-plot.figure

@@ -32,7 +32,6 @@ def create_phyloseq_object(seqtab, taxa, metadata):
     except Exception as e:
         logger.error(f"Error creating phyloseq object: {e}", exc_info=True)
         return None
-
 def calculate_alpha_diversity(ps1, treatment):
     try:
         logger.info("Calculating Alpha Diversity...")
