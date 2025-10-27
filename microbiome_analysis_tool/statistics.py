@@ -56,22 +56,336 @@ def perform_pairwise_alpha_tests(alpha_df, treatment_col, p_adjust_method='fdr_b
     results_df['p_adj'], results_df['significant'] = p_adjusted, reject
     return results_df
 
-def run_permanova(distance_matrix, metadata_df, treatment_column):
-    try:
-        results = permanova(distance_matrix, metadata_df, column=treatment_column)
-        p_value, test_stat = results['p-value'], results['test statistic']
-        interpretation = "statistically significant (p < 0.05)" if p_value < 0.05 else "not statistically significant (p >= 0.05)"
-        color = 'green' if p_value < 0.05 else 'red'
+def _ensure_numpy_distance(distance_matrix, metadata_df=None):
+    """
+    Accepts a pandas DataFrame with the same index/columns or a numpy array.
+    If DataFrame, aligns metadata to its index order.
+    """
+    if isinstance(distance_matrix, pd.DataFrame):
+        D = distance_matrix.values.astype(float, copy=False)
+        if metadata_df is not None:
+            metadata_df = metadata_df.loc[distance_matrix.index]
+        return D, metadata_df
+    D = np.asarray(distance_matrix, dtype=float)
+    return D, metadata_df
 
-        return html.Div([
-            html.H4("Beta Diversity Significance (PERMANOVA)"),
-            html.P(f"P-value: {p_value:.4f}"),
-            html.P(f"Test Statistic (pseudo-F): {test_stat:.4f}"),
-            html.P(f"The difference in community composition between groups is {interpretation}.", style={'color': color, 'fontWeight': 'bold'})
-        ])
-    except Exception as e:
-        logger.error(f"Could not calculate PERMANOVA: {e}")
-        return html.Div([html.H4("PERMANOVA Error"), html.P(f"Details: {e}")])
+def _drop_missing(metadata_df, factors):
+    """Drop rows with NA in any factor and return kept index mask."""
+    mask = ~metadata_df[factors].isnull().any(axis=1)
+    return metadata_df.loc[mask], mask
+
+def _gower_center(D):
+    """
+    Gower-centering of a full pairwise distance matrix.
+    Returns G = -0.5 * J * D^2 * J
+    """
+    D2 = D**2
+    n = D.shape[0]
+    J = np.eye(n) - np.ones((n, n))/n
+    return -0.5 * (J @ D2 @ J)
+
+def _onehot_design(metadata_df, cols, level_map=None):
+    """
+    Build a design matrix X (without intercept).
+    - Categorical columns: one-hot with drop_first=True (treatment coding).
+      Optional 'level_map' lets you enforce specific level order per column.
+    - Numeric columns: included as is (float).
+    Returns X (n x p), df_per_term (dict), and per-term column slices.
+    """
+    mats = []
+    term_slices = {}
+    df_per_term = {}
+    start = 0
+
+    for col in cols:
+        x = metadata_df[col]
+        if (pd.api.types.is_categorical_dtype(x) or x.dtype == object):
+            if level_map and col in level_map:
+                # enforce level order
+                cats = level_map[col]
+                x = pd.Categorical(x, categories=cats, ordered=True)
+            else:
+                # ensure deterministic order (sorted unique)
+                x = pd.Categorical(x, categories=pd.unique(x.astype(str)), ordered=True)
+
+            M = pd.get_dummies(x, drop_first=True)
+            block = M.to_numpy(dtype=float, copy=False)
+            p = block.shape[1]  # Df for this term
+            if p == 0:
+                # single level -> contributes nothing (skip)
+                term_slices[col] = slice(start, start)
+                df_per_term[col] = 0
+                continue
+            mats.append(block)
+            term_slices[col] = slice(start, start + p)
+            df_per_term[col] = p
+            start += p
+        else:
+            block = x.to_numpy(dtype=float).reshape(-1, 1)
+            mats.append(block)
+            term_slices[col] = slice(start, start + 1)
+            df_per_term[col] = 1
+            start += 1
+
+    X = np.concatenate(mats, axis=0 if len(mats) and mats[0].ndim == 1 else 1) if mats else np.zeros((len(metadata_df), 0))
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    return X, df_per_term, term_slices
+
+def _proj_hat(X):
+    """
+    Return projection (hat) matrix H for design X with an intercept.
+    H = X_ (X_' X_)^+ X_'  where X_ = [1, X]
+    Uses pinv for numerical stability.
+    """
+    n = X.shape[0]
+    X_ = np.column_stack([np.ones((n, 1)), X])
+    XtX_inv = np.linalg.pinv(X_.T @ X_, rcond=1e-12)
+    H = X_ @ XtX_inv @ X_.T
+    return H
+
+def _perm_indices_within_strata(strata_series, rng):
+    """
+    Produce a permutation of indices that shuffles within each stratum (block).
+    """
+    codes = pd.Series(strata_series).astype('category').cat.codes.to_numpy()
+    perm = np.arange(len(codes))
+    for code in np.unique(codes):
+        idx = np.where(codes == code)[0]
+        perm[idx] = rng.permutation(idx)
+    return perm
+
+# ------------------------------
+# Core: Multifactor PERMANOVA (marginal tests via Freedman–Lane)
+# ------------------------------
+
+def permanova_marginal(
+    distance_matrix,
+    metadata_df,
+    factors,
+    permutations=999,
+    strata=None,
+    random_state=None,
+    level_map=None,
+):
+    """
+    Multifactor PERMANOVA with marginal (Type III-like) tests via Freedman–Lane permutations.
+
+    Parameters
+    ----------
+    distance_matrix : (n x n) numpy.ndarray or pandas.DataFrame
+        Symmetric pairwise distance matrix. If DataFrame, index/columns should be sample IDs.
+    metadata_df : pandas.DataFrame
+        Rows indexed by sample IDs (will be aligned to distance if DataFrame was passed).
+    factors : list[str]
+        Column names in metadata_df to include in the model.
+    permutations : int, default 999
+        Number of permutations for p-values.
+    strata : array-like or pandas Series, optional
+        Blocking factor; permutations are restricted within levels of 'strata'.
+    random_state : int or np.random.Generator, optional
+        Seed or RNG for reproducibility.
+    level_map : dict[str, list], optional
+        Dict mapping factor -> ordered list of levels (for categorical factors),
+        to enforce specific reference/contrast coding (match R if needed).
+
+    Returns
+    -------
+    pandas.DataFrame with columns:
+        term, Df, SS, R2, F, p_value
+        (sorted by R2 descending)
+    """
+    # Align inputs
+    D, metadata_df = _ensure_numpy_distance(distance_matrix, metadata_df)
+    if metadata_df is None:
+        raise ValueError("metadata_df must be provided when passing a numpy distance matrix.")
+
+    # Drop missing rows in factors (like R does)
+    metadata_df, mask = _drop_missing(metadata_df, factors)
+    if isinstance(distance_matrix, pd.DataFrame):
+        D = D[mask.values, :][:, mask.values]
+    else:
+        # assume already aligned; user must drop rows in D too if there are NAs
+        pass
+
+    n = D.shape[0]
+    if n != len(metadata_df):
+        raise ValueError("Distance matrix and metadata row counts do not match after NA dropping.")
+
+    # Build design
+    X_full, df_per_term, term_slices = _onehot_design(metadata_df, factors, level_map=level_map)
+
+    # Edge case: if all columns ended up empty (e.g., single-level factors only)
+    if X_full.shape[1] == 0:
+        raise ValueError("All factors collapsed (single level). No testable terms.")
+
+    # Projections and Gower-centered matrix
+    G = _gower_center(D)
+    SS_tot = np.trace(G)
+
+    H_full = _proj_hat(X_full)
+
+    rng = np.random.default_rng(random_state)
+
+    # Prepare strata as Series aligned to metadata if provided
+    strata_series = None
+    if strata is not None:
+        if isinstance(strata, (pd.Series, pd.Categorical)):
+            strata_series = strata.loc[metadata_df.index] if hasattr(strata, "index") else pd.Series(strata, index=metadata_df.index)
+        else:
+            # assume array-like aligned to metadata_df
+            strata_series = pd.Series(strata, index=metadata_df.index)
+
+    results = []
+
+    # Precompute residual DoF
+    df_resid = n - (X_full.shape[1] + 1)  # +1 for intercept
+    if df_resid < 1:
+        raise ValueError("Residual degrees of freedom < 1. Model is saturated.")
+
+    # For each term, compute marginal effect (full vs. reduced model without that term)
+    for term in factors:
+        p_term = df_per_term.get(term, 0)
+        if p_term == 0:
+            # no degrees for this term (e.g., only one level) -> skip with zeros
+            results.append({"term": term, "Df": 0, "SS": 0.0, "R2": 0.0, "F": np.nan, "p_value": 1.0})
+            continue
+
+        # Reduced design: drop columns of this term
+        cols_keep = np.ones(X_full.shape[1], dtype=bool)
+        cols_keep[term_slices[term]] = False
+        X_others = X_full[:, cols_keep] if cols_keep.any() else np.zeros((n, 0))
+        H_others = _proj_hat(X_others) if X_others.shape[1] > 0 else np.zeros((n, n))
+
+        # Sums of squares
+        SS_full   = np.trace(H_full   @ G @ H_full)
+        SS_others = np.trace(H_others @ G @ H_others)
+        SS_term   = SS_full - SS_others
+
+        MS_term = SS_term / p_term
+        MS_res  = (SS_tot - SS_full) / df_resid
+        F_obs   = MS_term / MS_res if MS_res > 0 else np.inf
+        R2      = SS_term / SS_tot if SS_tot > 0 else np.nan
+
+        # Freedman–Lane permutations under reduced model
+        # Residualized G under reduced model
+        I = np.eye(n)
+        R = (I - H_others) @ G @ (I - H_others)
+
+        # Spectral decomposition to get residual coordinates for shuffling
+        eigvals, eigvecs = np.linalg.eigh(R)
+        pos = eigvals > 1e-12
+        if not np.any(pos):
+            # If residual space is nearly zero, permutations won't change anything
+            p_value = 1.0
+        else:
+            U = eigvecs[:, pos] * np.sqrt(eigvals[pos])
+
+            exceed = 0
+            for _ in range(permutations):
+                if strata_series is None:
+                    perm = rng.permutation(n)
+                else:
+                    perm = _perm_indices_within_strata(strata_series, rng)
+
+                U_perm = U[perm, :]                 # permute residual coords
+                G_star = U_perm @ U_perm.T          # reconstructed permuted residual
+
+                # Recompose permuted G under the alternative:
+                G_perm = (H_others @ G @ H_others) + ((I - H_others) @ G_star @ (I - H_others))
+
+                SS_full_p   = np.trace(H_full   @ G_perm @ H_full)
+                SS_others_p = np.trace(H_others @ G_perm @ H_others)
+                SS_term_p   = SS_full_p - SS_others_p
+
+                MS_term_p = SS_term_p / p_term
+                MS_res_p  = (SS_tot - SS_full_p) / df_resid
+                F_p       = MS_term_p / MS_res_p if MS_res_p > 0 else np.inf
+
+                if F_p >= F_obs:
+                    exceed += 1
+
+            # add-one correction
+            p_value = (exceed + 1) / (permutations + 1)
+
+        results.append({"term": term, "Df": int(p_term), "SS": float(SS_term), "R2": float(R2), "F": float(F_obs), "p_value": float(p_value)})
+
+    out = pd.DataFrame(results).sort_values("R2", ascending=False).reset_index(drop=True)
+    return out
+
+# ------------------------------
+# (Optional) quick permdisp (betadisper) analog
+# ------------------------------
+
+def betadisper_anova(distance_matrix, groups):
+    """
+    Simple homogeneity-of-dispersion test:
+    1) Compute distances to each group's centroid in principal coordinate space (from Gower-centered distances).
+    2) One-way ANOVA on distances; F and p via permutations.
+
+    Returns pandas DataFrame with F and p-value (overall), plus group means.
+    """
+    if isinstance(distance_matrix, pd.DataFrame):
+        D = distance_matrix.values.astype(float, copy=False)
+        groups = pd.Series(groups).loc[distance_matrix.index]
+    else:
+        D = np.asarray(distance_matrix, dtype=float)
+        groups = pd.Series(groups)
+
+    G = _gower_center(D)
+    eigvals, eigvecs = np.linalg.eigh(G)
+    pos = eigvals > 1e-12
+    if not np.any(pos):
+        raise ValueError("No positive eigenvalues found for PCoA space.")
+    X = eigvecs[:, pos] * np.sqrt(eigvals[pos])  # PCoA coordinates
+
+    groups = pd.Series(groups).astype('category')
+    codes = groups.cat.codes.to_numpy()
+    levels = list(groups.cat.categories)
+
+    # Group centroids in Euclidean PCoA
+    centroids = np.vstack([X[codes == k].mean(axis=0) for k in range(len(levels))])
+    dists = np.sqrt(((X - centroids[codes])**2).sum(axis=1))
+
+    # One-way ANOVA components
+    grand_mean = dists.mean()
+    n = len(dists)
+    k = len(levels)
+    ss_total = ((dists - grand_mean)**2).sum()
+    ss_between = sum([((dists[codes == i].mean() - grand_mean)**2) * (codes == i).sum()
+                      for i in range(k)])
+    ss_within = ss_total - ss_between
+    df_between = k - 1
+    df_within = n - k
+    ms_between = ss_between / df_between if df_between > 0 else np.nan
+    ms_within = ss_within / df_within if df_within > 0 else np.nan
+    F_obs = ms_between / ms_within
+
+    # Permutation p-value by shuffling group labels
+    rng = np.random.default_rng(0)
+    perms = 999
+    exceed = 0
+    for _ in range(perms):
+        perm_codes = rng.permutation(codes)
+        centroids_p = np.vstack([X[perm_codes == i].mean(axis=0) for i in range(k)])
+        dists_p = np.sqrt(((X - centroids_p[perm_codes])**2).sum(axis=1))
+        grand_mean_p = dists_p.mean()
+        ss_between_p = sum([((dists_p[perm_codes == i].mean() - grand_mean_p)**2) * (perm_codes == i).sum()
+                            for i in range(k)])
+        ms_between_p = ss_between_p / df_between if df_between > 0 else np.nan
+        # reuse ms_within under permutation for speed? better recompute:
+        ss_total_p = ((dists_p - grand_mean_p)**2).sum()
+        ss_within_p = ss_total_p - ss_between_p
+        ms_within_p = ss_within_p / df_within if df_within > 0 else np.nan
+        F_p = ms_between_p / ms_within_p
+        if F_p >= F_obs:
+            exceed += 1
+    p_value = (exceed + 1) / (perms + 1)
+
+    return pd.DataFrame({
+        "stat": ["F", "p_value"],
+        "value": [float(F_obs), float(p_value)]
+    }), pd.DataFrame({"group": levels, "mean_distance": [dists[codes == i].mean() for i in range(k)]})
 
 def run_differential_abundance(ps1_object, treatment_column):
     try:

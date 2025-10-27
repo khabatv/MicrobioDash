@@ -17,7 +17,7 @@ from .analysis import (
     create_phyloseq_object, calculate_alpha_diversity, calculate_beta_diversity,
     perform_pcoa, perform_pca, perform_nmds, perform_pcoa_aitchison
 )
-from .statistics import (perform_pairwise_alpha_tests, run_permanova, run_differential_abundance, 
+from .statistics import (perform_pairwise_alpha_tests, permanova_marginal, betadisper_anova, run_differential_abundance, 
                          run_indicator_species, run_mixed_effect_model, run_pymc_zinb_mixed_model, run_ancom_skbio)
 from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abundance_by_order, plot_abundance_by_taxlevel, plot_ancom_clr_heatmap, 
                        plot_lme_results, format_lme_results_for_display)
@@ -25,6 +25,7 @@ from .reporting import generate_pdf_report
 from .utils import fill_taxonomy_forward
 from dash import no_update
 from .plotting import apply_pub_style, get_pub_palette
+from typing import List, Optional
 # --- Initialize Dash App ---
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
@@ -159,6 +160,44 @@ def _infer_group_order(meta_df: pd.DataFrame, treat_col: str) -> list:
 
     # (c) fallback: first-seen order in metadata
     return list(dict.fromkeys(s.astype(str).tolist()))
+def _pick_multifactor_terms(
+    meta_df: pd.DataFrame,
+    extra: Optional[List[str]] = None,
+    max_levels: int = 50
+) -> List[str]:
+    """
+    Choose multifactor terms present in metadata (case-insensitive).
+    - Includes a default set of common factors.
+    - 'extra' lets you force-include columns (e.g., treat_col, custom names).
+    - Drops columns that have <2 non-NA unique values.
+    - Skips very high-cardinality categoricals (> max_levels).
+    Returns actual column names in metadata order.
+    """
+    default_candidates = [
+        "time", "run", "substrate", "media", "cultivar",
+        "cultivation_unit", "time_d"
+    ]
+
+    lower_map = {c.lower(): c for c in meta_df.columns}
+
+    wanted = list(default_candidates)
+    if extra:
+        wanted.extend([e.lower() for e in extra])
+
+    seen = set()
+    wanted = [w for w in wanted if not (w in seen or seen.add(w))]
+
+    terms = [lower_map[w] for w in wanted if w in lower_map]
+
+    cleaned: List[str] = []
+    for t in terms:
+        s = meta_df[t].dropna()
+        if s.nunique() < 2:
+            continue
+        if not pd.api.types.is_numeric_dtype(s) and s.astype(str).nunique() > max_levels:
+            continue
+        cleaned.append(t)
+    return cleaned
 # --- Callbacks ---
 
 @app.callback(
@@ -468,8 +507,106 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         asv_rel, meta_rel = calculate_beta_diversity(ps1)
         pcoa_scores, dm, pcoa_var = perform_pcoa(asv_rel, meta_rel, treat_col)
         global_data['pcoa_scores'] = pcoa_scores
-        permanova_res = run_permanova(dm, meta_rel, treat_col)
-
+        
+        # ---- Multifactor PERMANOVA (pure-Python, marginal tests) ----
+        desired = ["Run", "Substrate", "Media", "Cultivar", "Cultivation_Unit", "TIME_D"]
+        mf_terms = [c for c in desired if c in meta_rel.columns]
+        
+        # (optional) sanity filter: drop constant or all-NA factors
+        mf_terms = [c for c in mf_terms if meta_rel[c].dropna().astype(str).nunique() >= 2]
+        permanova_res = html.Div()  # default
+        
+        try:
+            if len(mf_terms) >= 2:
+                # Stratify permutations within 'run' if present
+                strata_vec = meta_rel['run'] if 'run' in meta_rel.columns else None
+        
+                mf_res = permanova_marginal(
+                    distance_matrix=pd.DataFrame(dm.data, index=dm.ids, columns=dm.ids),
+                    metadata_df=meta_rel,
+                    factors=mf_terms,
+                    permutations=999,
+                    strata=strata_vec,
+                    random_state=42,
+                    level_map=None
+                )
+        
+                # Table
+                header = ["Factor", "Df", "R²", "F", "p-value"]
+                rows = []
+                for _, r in mf_res.iterrows():
+                    color = "green" if r["p_value"] < 0.05 else "red"
+                    rows.append(
+                        html.Tr([
+                            html.Td(str(r["term"])),
+                            html.Td(str(int(r["Df"]))),
+                            html.Td(f"{r['R2']:.4f}"),
+                            html.Td(f"{r['F']:.4f}" if np.isfinite(r["F"]) else "inf"),
+                            html.Td(html.Span(f"{r['p_value']:.4f}", style={"color": color, "fontWeight": "bold"})),
+                        ])
+                    )
+        
+                # R² bar
+                try:
+                    r2_fig = px.bar(
+                        mf_res.sort_values("R2", ascending=False),
+                        x="term", y="R2",
+                        title="PERMANOVA (Multifactor) – R² by Factor (marginal)",
+                        text="R2",
+                    )
+                    r2_fig.update_traces(texttemplate="%{text:.3f}", textposition="outside", cliponaxis=False)
+                    r2_fig.update_layout(
+                        margin=dict(l=40, r=30, t=60, b=100),
+                        yaxis_title="Proportion of variance (R²)",
+                        xaxis_title="Factor",
+                        showlegend=False,
+                        height=420,
+                    )
+                    apply_pub_style(r2_fig, portrait=True, base_font=16)
+                    r2_graph = dcc.Graph(figure=r2_fig)
+                except Exception as _e_plot:
+                    r2_graph = html.P("(R² plot could not be rendered)")
+        
+                base_div = html.Div([
+                    html.H4("Multifactor PERMANOVA (marginal tests; each factor controlled for others)"),
+                    html.P(f"Factors included: {', '.join(mf_terms)}" + (" | Permutations stratified by 'run'." if strata_vec is not None else "")),
+                    html.Table([
+                        html.Thead(html.Tr([html.Th(h) for h in header])),
+                        html.Tbody(rows)
+                    ], style={"margin": "10px auto", "width": "95%"}),
+                    r2_graph
+                ], style={"border": "1px solid #ddd", "padding": "10px", "borderRadius": "8px", "marginTop": "10px"})
+        
+                # Optional: dispersion check (betadisper analog) for the plotting/grouping factor
+                permdisp_div = html.Div()
+                try:
+                    disp_tbl, _ = betadisper_anova(
+                        pd.DataFrame(dm.data, index=dm.ids, columns=dm.ids),
+                        meta_rel[treat_col]
+                    )
+                    permdisp_div = html.Div([
+                        html.H5("Dispersion check (betadisper analog)"),
+                        html.P(f"F = {disp_tbl.loc[disp_tbl['stat']=='F', 'value'].values[0]:.4f}, "
+                               f"p = {disp_tbl.loc[disp_tbl['stat']=='p_value', 'value'].values[0]:.4f}"),
+                    ], style={"marginTop": "8px"})
+                except Exception as _e_disp:
+                    logger.warning(f"Dispersion check failed: {_e_disp}")
+        
+                permanova_res = html.Div([base_div, permdisp_div])
+        
+            else:
+                permanova_res = html.Div([
+                    html.H4("Multifactor PERMANOVA"),
+                    html.P("Skipped: fewer than two candidate factors were found in metadata.")
+                ], style={"color": "#666"})
+        
+        except Exception as e_mf:
+            logger.error(f"Multifactor PERMANOVA failed: {e_mf}", exc_info=True)
+            permanova_res = html.Div([
+                html.H4("Multifactor PERMANOVA"),
+                html.P("Computation failed."),
+                html.Pre(str(e_mf), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
+            ])
         pcoa_fig = px.scatter(
             pcoa_scores,
             x='PC1', y='PC2',
