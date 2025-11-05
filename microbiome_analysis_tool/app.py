@@ -18,14 +18,16 @@ from .analysis import (
     perform_pcoa, perform_pca, perform_nmds, perform_pcoa_aitchison
 )
 from .statistics import (perform_pairwise_alpha_tests, permanova_marginal, betadisper_anova, run_differential_abundance, 
-                         run_indicator_species, run_mixed_effect_model, run_pymc_zinb_mixed_model, run_ancom_skbio)
+                         run_indicator_species, run_mixed_effect_model, run_pymc_zinb_mixed_model, run_ancom_skbio, valid_interaction)
 from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abundance_by_order, plot_abundance_by_taxlevel, plot_ancom_clr_heatmap, 
                        plot_lme_results, format_lme_results_for_display)
 from .reporting import generate_pdf_report
 from .utils import fill_taxonomy_forward
 from dash import no_update
+from dash import dash_table
 from .plotting import apply_pub_style, get_pub_palette
 from typing import List, Optional
+from .statistics import add_interactions
 # --- Initialize Dash App ---
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
@@ -501,144 +503,289 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
             except TypeError:
                 alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df)
 
-        global_data['alpha_fig'] = alpha_fig
+                global_data['alpha_fig'] = alpha_fig
 
         # ---- Beta Diversity & Ordinations ----
         asv_rel, meta_rel = calculate_beta_diversity(ps1)
+        # Make a copy to avoid SettingWithCopyWarning
+        meta_rel = meta_rel.copy()
+
         pcoa_scores, dm, pcoa_var = perform_pcoa(asv_rel, meta_rel, treat_col)
         global_data['pcoa_scores'] = pcoa_scores
-        
-        # ---- Multifactor PERMANOVA (pure-Python, marginal tests) ----
-        desired = ["Run", "Substrate", "Media", "Cultivar", "Cultivation_Unit", "TIME_D"]
-        mf_terms = [c for c in desired if c in meta_rel.columns]
-        
-        # (optional) sanity filter: drop constant or all-NA factors
-        mf_terms = [c for c in mf_terms if meta_rel[c].dropna().astype(str).nunique() >= 2]
-        permanova_res = html.Div()  # default
-        
-        try:
-            if len(mf_terms) >= 2:
-                # Stratify permutations within 'run' if present
-                strata_vec = meta_rel['run'] if 'run' in meta_rel.columns else None
-        
-                mf_res = permanova_marginal(
-                    distance_matrix=pd.DataFrame(dm.data, index=dm.ids, columns=dm.ids),
-                    metadata_df=meta_rel,
-                    factors=mf_terms,
-                    permutations=999,
-                    strata=strata_vec,
-                    random_state=42,
-                    level_map=None
-                )
-        
-                # Table
-                header = ["Factor", "Df", "R²", "F", "p-value"]
-                rows = []
-                for _, r in mf_res.iterrows():
-                    color = "green" if r["p_value"] < 0.05 else "red"
-                    rows.append(
-                        html.Tr([
-                            html.Td(str(r["term"])),
-                            html.Td(str(int(r["Df"]))),
-                            html.Td(f"{r['R2']:.4f}"),
-                            html.Td(f"{r['F']:.4f}" if np.isfinite(r["F"]) else "inf"),
-                            html.Td(html.Span(f"{r['p_value']:.4f}", style={"color": color, "fontWeight": "bold"})),
-                        ])
-                    )
-        
-                # R² bar
-                try:
-                    r2_fig = px.bar(
-                        mf_res.sort_values("R2", ascending=False),
-                        x="term", y="R2",
-                        title="PERMANOVA (Multifactor) – R² by Factor (marginal)",
-                        text="R2",
-                    )
-                    r2_fig.update_traces(texttemplate="%{text:.3f}", textposition="outside", cliponaxis=False)
-                    r2_fig.update_layout(
-                        margin=dict(l=40, r=30, t=60, b=100),
-                        yaxis_title="Proportion of variance (R²)",
-                        xaxis_title="Factor",
-                        showlegend=False,
-                        height=420,
-                    )
-                    apply_pub_style(r2_fig, portrait=True, base_font=16)
-                    r2_graph = dcc.Graph(figure=r2_fig)
-                except Exception as _e_plot:
-                    r2_graph = html.P("(R² plot could not be rendered)")
-        
-                base_div = html.Div([
-                    html.H4("Multifactor PERMANOVA (marginal tests; each factor controlled for others)"),
-                    html.P(f"Factors included: {', '.join(mf_terms)}" + (" | Permutations stratified by 'run'." if strata_vec is not None else "")),
-                    html.Table([
-                        html.Thead(html.Tr([html.Th(h) for h in header])),
-                        html.Tbody(rows)
-                    ], style={"margin": "10px auto", "width": "95%"}),
-                    r2_graph
-                ], style={"border": "1px solid #ddd", "padding": "10px", "borderRadius": "8px", "marginTop": "10px"})
-        
-                # Optional: dispersion check (betadisper analog) for the plotting/grouping factor
-                permdisp_div = html.Div()
-                try:
-                    disp_tbl, _ = betadisper_anova(
-                        pd.DataFrame(dm.data, index=dm.ids, columns=dm.ids),
-                        meta_rel[treat_col]
-                    )
-                    permdisp_div = html.Div([
-                        html.H5("Dispersion check (betadisper analog)"),
-                        html.P(f"F = {disp_tbl.loc[disp_tbl['stat']=='F', 'value'].values[0]:.4f}, "
-                               f"p = {disp_tbl.loc[disp_tbl['stat']=='p_value', 'value'].values[0]:.4f}"),
-                    ], style={"marginTop": "8px"})
-                except Exception as _e_disp:
-                    logger.warning(f"Dispersion check failed: {_e_disp}")
-        
-                permanova_res = html.Div([base_div, permdisp_div])
-        
-            else:
-                permanova_res = html.Div([
-                    html.H4("Multifactor PERMANOVA"),
-                    html.P("Skipped: fewer than two candidate factors were found in metadata.")
-                ], style={"color": "#666"})
-        
-        except Exception as e_mf:
-            logger.error(f"Multifactor PERMANOVA failed: {e_mf}", exc_info=True)
-            permanova_res = html.Div([
-                html.H4("Multifactor PERMANOVA"),
-                html.P("Computation failed."),
-                html.Pre(str(e_mf), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
-            ])
+
+        # Ensure group order and categorical factors
+        meta_rel[treat_col] = pd.Categorical(
+            meta_rel[treat_col],
+            categories=group_order,
+            ordered=True,
+        )
+    # ---- (Always) build ordination figures ----
         pcoa_fig = px.scatter(
             pcoa_scores,
             x='PC1', y='PC2',
             color=treat_col,
             title="PCoA (Bray-Curtis)",
-            labels={"PC1": f"PC1 ({pcoa_var['PC1']*100:.2f}%)",
-                    "PC2": f"PC2 ({pcoa_var['PC2']*100:.2f}%)"},
+            labels={
+                "PC1": f"PC1 ({pcoa_var['PC1']*100:.2f}%)",
+                "PC2": f"PC2 ({pcoa_var['PC2']*100:.2f}%)"
+            },
             category_orders={treat_col: group_order},
             color_discrete_sequence=palette_groups,
         )
         apply_pub_style(pcoa_fig, portrait=True, base_font=16)
         global_data['pcoa_fig'] = pcoa_fig
-
-        # Aitchison (CLR-Euclidean) PCoA
+    
+        # Aitchison (CLR-Euclidean)
         pcoa_ait_scores, dm_ait, var_ait = perform_pcoa_aitchison(ps1, treat_col)
         var_vals = np.asarray(var_ait).ravel()
         pc1_lbl = f"PC1 ({(var_vals[0]*100):.2f}%)" if len(var_vals) > 0 else "PC1"
         pc2_lbl = f"PC2 ({(var_vals[1]*100):.2f}%)" if len(var_vals) > 1 else "PC2"
-
         pcoa_ait_fig = px.scatter(
             pcoa_ait_scores,
             x=pcoa_ait_scores.columns[0], y=pcoa_ait_scores.columns[1],
             color=treat_col,
             title="PCoA (Aitchison / CLR-Euclidean)",
-            labels={pcoa_ait_scores.columns[0]: pc1_lbl,
-                    pcoa_ait_scores.columns[1]: pc2_lbl},
+            labels={
+                pcoa_ait_scores.columns[0]: pc1_lbl,
+                pcoa_ait_scores.columns[1]: pc2_lbl
+            },
             category_orders={treat_col: group_order},
             color_discrete_sequence=palette_groups,
         )
         apply_pub_style(pcoa_ait_fig, portrait=True, base_font=16)
+        # ---- PERMANOVA (multifactor, marginal tests) ----
+        # Base candidate factors (subset automatically by metadata)
+        base_terms = [
+            "Substrate", "Media", "TIME_D", "Run",
+            "Cultivar", "Cultivation_Unit"
+        ]
+        mf_terms = [c for c in base_terms if c in meta_rel.columns]
 
-        # ---- NMDS (robust) ----
+        permanova_res = html.Div()  # default empty placeholder
+
+        try:
+            # Filter out factors with only 1 non-NA level
+            mf_terms = [c for c in mf_terms
+                        if meta_rel[c].nunique(dropna=True) > 1]
+
+            if len(mf_terms) >= 2:
+                meta_rel["TIME_D"] = pd.to_numeric(meta_rel["TIME_D"], errors="coerce")
+
+                for col in mf_terms:
+                    s = meta_rel[col]
+                    if col == "TIME_D":
+                        continue  # force continuous
+                    if (s.dtype == object) or (s.nunique(dropna=True) <= 10):
+                        meta_rel[col] = s.astype("category")
+
+                # case-insensitive lookup for "run" as a blocking factor
+                run_col = next(
+                    (c for c in meta_rel.columns if c.lower() == "run"),
+                    None,
+                )
+                strata_vec = meta_rel[run_col] if run_col is not None else None
+
+                # ---------------------------
+                # Dynamically select interactions
+                # ---------------------------
+                factors = mf_terms  # main effects to include
+
+                # Candidate interactions to consider
+                candidate_pairs = [
+                    ("Cultivar", "Media"),
+                    ("Media", "Cultivation_Unit"),
+                    ("Media", "TIME_D"),
+                    ("Substrate", "Media"),
+                ]
+
+                # Keep only estimable interactions given the actual data
+                interactions = [
+                    f"{a}:{b}" for a, b in candidate_pairs
+                    if valid_interaction(meta_rel, a, b)
+                ]
+
+                print("Included factors:", factors)
+                print("Included interactions:", interactions)
+
+                # Run PERMANOVA
+                mf_res = permanova_marginal(
+                    distance_matrix=pd.DataFrame(
+                        dm_ait.data, index=dm_ait.ids, columns=dm_ait.ids
+                    ),
+                    metadata_df=meta_rel,
+                    factors=factors,
+                    interactions=interactions,
+                    permutations=999,
+                    strata=strata_vec,
+                    random_state=42,
+                    level_map=None,
+                )
+
+                # Save PERMANOVA table
+                permanova_csv_path = os.path.join(
+                    out_dir, "permanova_multifactor_results.csv"
+                )
+                mf_res.to_csv(permanova_csv_path, index=False)
+
+                # R² bar plot
+                r2_fig = px.bar(
+                    mf_res.sort_values("R2", ascending=False),
+                    x="term",
+                    y="R2",
+                    text="R2",
+                    title="PERMANOVA (Multifactor) – R² by factor (marginal)",
+                )
+                r2_fig.update_traces(
+                    texttemplate="%{text:.3f}",
+                    textposition="outside",
+                    cliponaxis=False,
+                )
+                r2_fig.update_layout(
+                    margin=dict(l=40, r=30, t=60, b=100),
+                    yaxis_title="Proportion of variance (R²)",
+                    xaxis_title="Factor",
+                    showlegend=False,
+                    height=420,
+                )
+                apply_pub_style(r2_fig, portrait=True, base_font=16)
+                r2_graph = dcc.Graph(figure=r2_fig)
+
+                # PERMDISP (homogeneity of dispersion) – only for factors
+                # that still have >=2 groups
+                permdisp_rows = []
+                for col in [
+                    c for c in ["Substrate", "Media", "Cultivar", "Cultivation_Unit"]
+                    if c in meta_rel.columns and meta_rel[c].nunique(dropna=True) > 1
+                ]:
+                    try:
+                        disp_tbl, group_means = betadisper_anova(
+                            pd.DataFrame(dm_ait.data, index=dm_ait.ids, columns=dm_ait.ids),
+                            meta_rel[col],
+                        )
+                        F_val = float(
+                            disp_tbl.loc[disp_tbl["stat"] == "F", "value"].values[0]
+                        )
+                        p_val = float(
+                            disp_tbl.loc[disp_tbl["stat"] == "p_value", "value"].values[0]
+                        )
+                        permdisp_rows.append(
+                            {"Factor": col, "F": F_val, "p_value": p_val}
+                        )
+                    except Exception as e_disp:
+                        logger.warning(f"Dispersion check failed for {col}: {e_disp}")
+
+                permdisp_df = pd.DataFrame(permdisp_rows)
+                permdisp_csv_path = os.path.join(out_dir, "permdisp_results.csv")
+                permdisp_df.to_csv(permdisp_csv_path, index=False)
+
+                # Tables
+                permanova_table = dash_table.DataTable(
+                    data=(
+                        mf_res[["term", "Df", "R2", "F", "p_value"]]
+                        .rename(
+                            columns={
+                                "term": "Factor",
+                                "Df": "Df",
+                                "R2": "R²",
+                                "F": "F",
+                                "p_value": "p-value",
+                            }
+                        )
+                        .round(4)
+                        .to_dict("records")
+                    ),
+                    columns=[
+                        {"name": c, "id": c}
+                        for c in ["Factor", "Df", "R²", "F", "p-value"]
+                    ],
+                    sort_action="native",
+                    filter_action="native",
+                    style_table={"overflowX": "auto"},
+                    style_cell={"padding": "6px", "fontSize": 14},
+                    style_header={"fontWeight": "bold"},
+                )
+
+                permdisp_table = dash_table.DataTable(
+                    data=permdisp_df.round(4).to_dict("records"),
+                    columns=[{"name": c, "id": c} for c in permdisp_df.columns],
+                    sort_action="native",
+                    filter_action="native",
+                    style_table={"overflowX": "auto"},
+                    style_cell={"padding": "6px", "fontSize": 14},
+                    style_header={"fontWeight": "bold"},
+                )
+
+                permanova_res = html.Div(
+                    [
+                        html.H4(
+                            "Multifactor PERMANOVA "
+                            "(marginal tests; each factor controlled for others)"
+                        ),
+                        html.P(
+                            "Terms included: "
+                            + ", ".join(factors + interactions)
+                            + (
+                                f" | Permutations stratified by '{run_col}'."
+                                if run_col
+                                else ""
+                            )
+                        ),
+                        html.H5("PERMANOVA results"),
+                        permanova_table,
+                        html.Br(),
+                        r2_graph,
+                        html.H5("Dispersion check (PERMDISP)"),
+                        permdisp_table,
+                        html.Div(
+                            [
+                                html.P("Saved to:"),
+                                html.Ul(
+                                    [
+                                        html.Li(
+                                            html.Code(
+                                                os.path.basename(permanova_csv_path)
+                                            )
+                                        ),
+                                        html.Li(
+                                            html.Code(
+                                                os.path.basename(permdisp_csv_path)
+                                            )
+                                        ),
+                                    ]
+                                ),
+                            ],
+                            style={"marginTop": "10px", "color": "#555"},
+                        ),
+                    ],
+                    style={
+                        "border": "1px solid #ddd",
+                        "padding": "10px",
+                        "borderRadius": "8px",
+                        "marginTop": "10px",
+                    },
+                )
+            else:
+                permanova_res = html.Div(
+                    [
+                        html.H4("Multifactor PERMANOVA"),
+                        html.P(
+                            "Skipped: fewer than two factors with >1 level "
+                            "available in metadata."
+                        ),
+                    ],
+                    style={"color": "#666"},
+                )
+        except Exception as e_perm:
+            logger.error(f"PERMANOVA/PERMDISP failed: {e_perm}", exc_info=True)
+            # keep permanova_res as default or replace with an error div if you want
+            pass
+
+
+
+
+    
+
+        # ---- NMDS ----
         nmds_scores, nmds_stress = (None, None)
         try:
             nmds_scores, nmds_stress = perform_nmds(dm)
@@ -665,19 +812,22 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         pca_res, pca_var = perform_pca(ps1['asv'], int(top_asvs))
         pca_df = (
             pd.DataFrame(pca_res, columns=['PC1', 'PC2'], index=ps1['meta'].index)
-              .join(ps1['meta'][treat_col])
+            .join(ps1['meta'][treat_col])
         )
         pca_df[treat_col] = pd.Categorical(pca_df[treat_col], categories=group_order, ordered=True)
-
         pca_fig = px.scatter(
             pca_df, x='PC1', y='PC2', color=treat_col,
             title=f"PCA (Top {top_asvs} ASVs)",
-            labels={"PC1": f"PC1 ({pca_var[0]*100:.2f}%)",
-                    "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"},
+            labels={
+                "PC1": f"PC1 ({pca_var[0]*100:.2f}%)",
+                "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"
+            },
             category_orders={treat_col: group_order},
             color_discrete_sequence=palette_groups,
         )
         apply_pub_style(pca_fig, portrait=True, base_font=16)
+
+
 
         # --- Plots & Stats ---
         seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
@@ -685,231 +835,232 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         global_data['seq_depth_fig'] = seq_depth_fig
         
 
-        # Abundance plots (guard if functions don't accept group_order)
+            # Abundance plots (guard if functions don't accept group_order)
         try:
             abund_order_fig = plot_abundance_by_order(ps1, treat_col, group_order=group_order)
         except TypeError:
             abund_order_fig = plot_abundance_by_order(ps1, treat_col)
         global_data['abundance_order_plot'] = abund_order_fig
-
+    
         try:
-            abund_genus_fig = plot_abundance_by_taxlevel(
-                ps1, treat_col, tax_level="Genus", threshold=0.01, group_order=group_order
-            )
+                abund_genus_fig = plot_abundance_by_taxlevel(
+                    ps1, treat_col, tax_level="Genus", threshold=0.01, group_order=group_order
+                )
         except TypeError:
-            abund_genus_fig = plot_abundance_by_taxlevel(
-                ps1, treat_col, tax_level="Genus", threshold=0.01
-            )
+                abund_genus_fig = plot_abundance_by_taxlevel(
+                    ps1, treat_col, tax_level="Genus", threshold=0.01
+                )
         global_data['abundance_genus_plot'] = abund_genus_fig
-
+    
         ancom_df = pd.DataFrame()  # default empty
-
+    
         if da_method == 'ancom':
-            try:
-                ancom_df = run_ancom_skbio(ps1, treat_col, alpha=0.05)
-
-                # robust: only filter if 'reject' exists and is True
-                if 'reject' in ancom_df.columns:
-                    sig = ancom_df[ancom_df['reject'] == True].copy()
-                else:
-                    sig = ancom_df.iloc[0:0].copy()
-
-                cols = ['Feature_ID', 'W', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
-                cols = [c for c in cols if c in sig.columns]
-
-                diff_abund_res = html.Div([
-                    html.H4("ANCOM (scikit-bio) significant features (reject = True)"),
-                    html.P(f"Grouping: {treat_col} | alpha = 0.05 | correction = Holm–Bonferroni"),
-                    html.Table(
-                        [html.Thead(html.Tr([html.Th(c) for c in cols]))] +
-                        [html.Tbody([
-                            html.Tr([html.Td(sig.iloc[i][c]) for c in cols])
-                            for i in range(min(50, len(sig)))
-                        ])]
-                    )
-                ])
-
-                out_path = os.path.join(out_dir, 'ancom_results.csv')
-                ancom_df.to_csv(out_path, index=False)
-
-            except Exception as e_ancom:
-                logger.error(f"ANCOM (skbio) failed: {e_ancom}", exc_info=True)
-                diff_abund_res = html.Div([
-                    html.H4("ANCOM (Python) failed"),
-                    html.Pre(str(e_ancom), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
-                ])
+                try:
+                    ancom_df = run_ancom_skbio(ps1, treat_col, alpha=0.05)
+    
+                    # robust: only filter if 'reject' exists and is True
+                    if 'reject' in ancom_df.columns:
+                        sig = ancom_df[ancom_df['reject'] == True].copy()
+                    else:
+                        sig = ancom_df.iloc[0:0].copy()
+    
+                    cols = ['Feature_ID', 'W', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
+                    cols = [c for c in cols if c in sig.columns]
+    
+                    diff_abund_res = html.Div([
+                        html.H4("ANCOM (scikit-bio) significant features (reject = True)"),
+                        html.P(f"Grouping: {treat_col} | alpha = 0.05 | correction = Holm–Bonferroni"),
+                        html.Table(
+                            [html.Thead(html.Tr([html.Th(c) for c in cols]))] +
+                            [html.Tbody([
+                                html.Tr([html.Td(sig.iloc[i][c]) for c in cols])
+                                for i in range(min(50, len(sig)))
+                            ])]
+                        )
+                    ])
+    
+                    out_path = os.path.join(out_dir, 'ancom_results.csv')
+                    ancom_df.to_csv(out_path, index=False)
+    
+                except Exception as e_ancom:
+                    logger.error(f"ANCOM (skbio) failed: {e_ancom}", exc_info=True)
+                    diff_abund_res = html.Div([
+                        html.H4("ANCOM (Python) failed"),
+                        html.Pre(str(e_ancom), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
+                    ])
         else:
-            diff_abund_res = run_differential_abundance(ps1, treat_col)
-
-        # ---- Heatmap (guarded) ----
+                diff_abund_res = run_differential_abundance(ps1, treat_col)
+    
+            # ---- Heatmap (guarded) ----
         if not ancom_df.empty:
-            try:
-                ancom_heatmap_fig = plot_ancom_clr_heatmap(
-                    ancom_df,
-                    top_k=None,          # show ALL passing features
-                    clr_threshold=1.0,   # require CLR mean > 1 in ≥1 group
-                    w_threshold=1,       # require W > 1
-                    short_id_col='ASV',
-                    label_with_genus=True,
-                    group_order=group_order,  # only used if function supports it
-                )
-            except TypeError:
-                # older signature without group_order
-                ancom_heatmap_fig = plot_ancom_clr_heatmap(
-                    ancom_df,
-                    top_k=None,
-                    clr_threshold=1.0,
-                    w_threshold=1,
-                    short_id_col='ASV',
-                    label_with_genus=True,
-                )
-            apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
+                try:
+                    ancom_heatmap_fig = plot_ancom_clr_heatmap(
+                        ancom_df,
+                        top_k=None,          # show ALL passing features
+                        clr_threshold=1.0,   # require CLR mean > 1 in ≥1 group
+                        w_threshold=1,       # require W > 1
+                        short_id_col='ASV',
+                        label_with_genus=True,
+                        group_order=group_order,  # only used if function supports it
+                    )
+                except TypeError:
+                    # older signature without group_order
+                    ancom_heatmap_fig = plot_ancom_clr_heatmap(
+                        ancom_df,
+                        top_k=None,
+                        clr_threshold=1.0,
+                        w_threshold=1,
+                        short_id_col='ASV',
+                        label_with_genus=True,
+                    )
+                apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
         else:
-            ancom_heatmap_fig = go.Figure()
-            ancom_heatmap_fig.update_layout(
-                title="ANCOM heatmap (run with DA method = 'ANCOM' to populate)",
-                xaxis_title="Treatment",
-                yaxis_title="Feature",
-            )
-            apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
-# ---------------- Indicator species & tree (robust) ----------------
+                ancom_heatmap_fig = go.Figure()
+                ancom_heatmap_fig.update_layout(
+                    title="ANCOM heatmap (run with DA method = 'ANCOM' to populate)",
+                    xaxis_title="Treatment",
+                    yaxis_title="Feature",
+                )
+                apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
+    # ---------------- Indicator species & tree (robust) ----------------
         indic_spec_res = html.Div([html.H4("Indicator species"), html.P("No results computed.")])
         indic_df = pd.DataFrame()
         tree_img = None
-
+    
         try:
-            # Preflight checks for grouping
-            if treat_col not in ps1['meta'].columns:
-                raise ValueError(f"Treatment column '{treat_col}' not found in metadata.")
-        
-            meta_ok = ps1['meta'].copy()
-            meta_ok = meta_ok[meta_ok[treat_col].notna()]
-            if meta_ok.empty:
-                raise ValueError(f"No non-NA values in '{treat_col}' after filtering/subsetting.")
-
-    # Need ≥ 2 groups with ≥ 2 samples each
-            counts = meta_ok[treat_col].value_counts()
-            valid_groups = counts[counts >= 2].index.tolist()
-            if len(valid_groups) < 2:
-                raise ValueError(
-                    "Indicator species needs ≥ 2 groups with ≥ 2 samples each. "
-                    f"Group sizes: {counts.to_dict()}"
-                )
-
-    # Subset ps1 consistently to valid samples
-            valid_samples = meta_ok.index.tolist()
-            ps1_clean = {
-                'asv' : ps1['asv'].loc[:, valid_samples],
-                'tax' : ps1['tax'],
-                'meta': ps1['meta'].loc[valid_samples]
-            }
-
-    # Run indicator species on the clean object
-            indic_spec_res, indic_df = run_indicator_species(ps1_clean, treat_col)
-
+                # Preflight checks for grouping
+                if treat_col not in ps1['meta'].columns:
+                    raise ValueError(f"Treatment column '{treat_col}' not found in metadata.")
+            
+                meta_ok = ps1['meta'].copy()
+                meta_ok = meta_ok[meta_ok[treat_col].notna()]
+                if meta_ok.empty:
+                    raise ValueError(f"No non-NA values in '{treat_col}' after filtering/subsetting.")
+    
+        # Need ≥ 2 groups with ≥ 2 samples each
+                counts = meta_ok[treat_col].value_counts()
+                valid_groups = counts[counts >= 2].index.tolist()
+                if len(valid_groups) < 2:
+                    raise ValueError(
+                        "Indicator species needs ≥ 2 groups with ≥ 2 samples each. "
+                        f"Group sizes: {counts.to_dict()}"
+                    )
+    
+        # Subset ps1 consistently to valid samples
+                valid_samples = meta_ok.index.tolist()
+                ps1_clean = {
+                    'asv' : ps1['asv'].loc[:, valid_samples],
+                    'tax' : ps1['tax'],
+                    'meta': ps1['meta'].loc[valid_samples]
+                }
+    
+        # Run indicator species on the clean object
+                indic_spec_res, indic_df = run_indicator_species(ps1_clean, treat_col)
+    
         except Exception as e_indic:
-            logger.error(f"Indicator species failed: {e_indic}", exc_info=True)
-            indic_spec_res = html.Div([
-                html.H4("Indicator species"),
-                html.P("Computation failed."),
-                html.Pre(str(e_indic), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
-            ])
-
-# Tree: try to draw even if indicator step failed
+                logger.error(f"Indicator species failed: {e_indic}", exc_info=True)
+                indic_spec_res = html.Div([
+                    html.H4("Indicator species"),
+                    html.P("Computation failed."),
+                    html.Pre(str(e_indic), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
+                ])
+    
+    # Tree: try to draw even if indicator step failed
         try:
-            tree_img = plot_phylogenetic_tree(seqtab, taxa_filled, indic_df if not indic_df.empty else None)
-            global_data['tree_img'] = tree_img
+                tree_img = plot_phylogenetic_tree(seqtab, taxa_filled, indic_df if not indic_df.empty else None)
+                global_data['tree_img'] = tree_img
         except Exception as e_tree:
-            logger.error(f"Tree plotting failed: {e_tree}", exc_info=True)
-            tree_img = None
-
-
-        # Mixed Models
+                logger.error(f"Tree plotting failed: {e_tree}", exc_info=True)
+                tree_img = None
+    
+    
+            # Mixed Models
         if model_type == 'pymc_zinb':
-            lme_res_df = run_pymc_zinb_mixed_model(ps1, mem_treat, rand_eff, time_col, analysis_lvl, mem_top_n, mem_ref, force_feat)
+                lme_res_df = run_pymc_zinb_mixed_model(ps1, mem_treat, rand_eff, time_col, analysis_lvl, mem_top_n, mem_ref, force_feat)
         else:
-            lme_res_df = run_mixed_effect_model(ps1, mem_treat, rand_eff, time_col, analysis_lvl, mem_top_n, mem_ref, force_feat)
-
+                lme_res_df = run_mixed_effect_model(ps1, mem_treat, rand_eff, time_col, analysis_lvl, mem_top_n, mem_ref, force_feat)
+    
         mix_model_res = format_lme_results_for_display(
-            lme_res_df, ps1, mem_treat, time_col, mem_ref, mem_show_insig, force_feat
-        )
+                lme_res_df, ps1, mem_treat, time_col, mem_ref, mem_show_insig, force_feat
+            )
         mix_model_plot = plot_lme_results(lme_res_df, mem_show_insig)
-
-        # AI Interpretation & Outputs
+    
+            # AI Interpretation & Outputs
         df_asv = ps1['asv'].T.rename_axis('SampleID').reset_index()
         global_data['ps1_melt'] = df_asv.melt(id_vars='SampleID', var_name='ASV', value_name='Abundance')
         global_data['pca_result'] = (pca_res, pca_var)
         ai_interp = ai_interpret_results(global_data, background, treat_col)
         out_files = html.Div([html.P(f) for f in os.listdir(out_dir) if f.endswith('.csv')])
-
+    
         logger.info("Analysis completed successfully.")
-
-        # SUCCESS: 17 outputs in declared order
+    
+            # SUCCESS: 17 outputs in declared order
         return (
-            seq_depth_fig,        # 1  seq-depth-plot.figure
-            total_reads_fig,
-            alpha_fig,            # 2  alpha-diversity-plot.figure
-            pcoa_fig,             # 3  pcoa-plot.figure
-            pcoa_ait_fig,         # 4  pcoa-aitchison-plot.figure
-            pca_fig,              # 5  pca-plot.figure
-            nmds_fig,             # 6  nmds-plot.figure
-            permanova_res,        # 7  permanova-results.children
-            abund_order_fig,      # 8  abundance-order-plot.figure
-            abund_genus_fig,      # 9  abundance-genus-plot.figure
-            diff_abund_res,       # 10 differential-abundance-results.children
-            ancom_heatmap_fig,    # 11 ancom-heatmap.figure
-            indic_spec_res,       # 12 indicator-species-results.children
-            (html.Img(src=tree_img, style={'width': '100%'})
-             if tree_img else html.P("Tree could not be generated.")),  # 13 phylogenetic-tree.children
-            mix_model_res,        # 14 mixed-model-results.children
-            mix_model_plot,       # 15 mixed-model-plot.figure
-            ai_interp,            # 16 ai-interpretations.children
-            out_files             # 17 output-files.children
-        )
-
+                seq_depth_fig,        # 1  seq-depth-plot.figure
+                total_reads_fig,
+                alpha_fig,            # 2  alpha-diversity-plot.figure
+                pcoa_fig,             # 3  pcoa-plot.figure
+                pcoa_ait_fig,         # 4  pcoa-aitchison-plot.figure
+                pca_fig,              # 5  pca-plot.figure
+                nmds_fig,             # 6  nmds-plot.figure
+                permanova_res,        # 7  permanova-results.children
+                abund_order_fig,      # 8  abundance-order-plot.figure
+                abund_genus_fig,      # 9  abundance-genus-plot.figure
+                diff_abund_res,       # 10 differential-abundance-results.children
+                ancom_heatmap_fig,    # 11 ancom-heatmap.figure
+                indic_spec_res,       # 12 indicator-species-results.children
+                (html.Img(src=tree_img, style={'width': '100%'})
+                 if tree_img else html.P("Tree could not be generated.")),  # 13 phylogenetic-tree.children
+                mix_model_res,        # 14 mixed-model-results.children
+                mix_model_plot,       # 15 mixed-model-plot.figure
+                ai_interp,            # 16 ai-interpretations.children
+                out_files             # 17 output-files.children
+            )
+    
     except Exception as e:
-        logger.error(f"Error during analysis: {e}", exc_info=True)
-        error_fig = go.Figure(layout_title_text=f"Error: {e}")
-        error_msg = html.Div(
-            [html.H4("Analysis Failed"), html.P(f"Details: {e}")],
-            style={'color': 'red', 'fontWeight': 'bold'}
-        )
-        # ERROR: 17 outputs in declared order
-        return (
-            error_fig,  # 1  seq-depth-plot.figure
-            error_fig,
-            error_fig,  # 2  alpha-diversity-plot.figure
-            error_fig,  # 3  pcoa-plot.figure
-            error_fig,  # 4  pcoa-aitchison-plot.figure
-            error_fig,  # 5  pca-plot.figure
-            error_fig,  # 6  nmds-plot.figure
-            error_msg,  # 7  permanova-results.children
-            error_fig,  # 8  abundance-order-plot.figure
-            error_fig,  # 9  abundance-genus-plot.figure
-            error_msg,  # 10 differential-abundance-results.children
-            error_fig,  # 11 ancom-heatmap.figure
-            error_msg,  # 12 indicator-species-results.children
-            error_msg,  # 13 phylogenetic-tree.children
-            error_msg,  # 14 mixed-model-results.children
-            error_fig,  # 15 mixed-model-plot.figure
-            f"### Error\n{e}",  # 16 ai-interpretations.children
-            error_msg   # 17 output-files.children
-        )
-
-@app.callback(
+            logger.error(f"Error during analysis: {e}", exc_info=True)
+            error_fig = go.Figure(layout_title_text=f"Error: {e}")
+            error_msg = html.Div(
+                [html.H4("Analysis Failed"), html.P(f"Details: {e}")],
+                style={'color': 'red', 'fontWeight': 'bold'}
+            )
+            # ERROR: 17 outputs in declared order
+            return (
+                error_fig,  # 1  seq-depth-plot.figure
+                error_fig,
+                error_fig,  # 2  alpha-diversity-plot.figure
+                error_fig,  # 3  pcoa-plot.figure
+                error_fig,  # 4  pcoa-aitchison-plot.figure
+                error_fig,  # 5  pca-plot.figure
+                error_fig,  # 6  nmds-plot.figure
+                error_msg,  # 7  permanova-results.children
+                error_fig,  # 8  abundance-order-plot.figure
+                error_fig,  # 9  abundance-genus-plot.figure
+                error_msg,  # 10 differential-abundance-results.children
+                error_fig,  # 11 ancom-heatmap.figure
+                error_msg,  # 12 indicator-species-results.children
+                error_msg,  # 13 phylogenetic-tree.children
+                error_msg,  # 14 mixed-model-results.children
+                error_fig,  # 15 mixed-model-plot.figure
+                f"### Error\n{e}",  # 16 ai-interpretations.children
+                error_msg   # 17 output-files.children
+            )
+    
+    @app.callback(
     Output('download-report', 'data'),
     Input('download-report-button', 'n_clicks'),
     State('output-dir', 'value'),
     State('ai-interpretations', 'children'),
     prevent_initial_call=True
 )
-def download_pdf_report(n_clicks, output_dir, interpretations_md):
-    if n_clicks > 0:
+    def download_pdf_report(n_clicks, output_dir, interpretations_md):
+     if n_clicks > 0:
         interpretations = interpretations_md or "No interpretation generated."
         report_path = generate_pdf_report(global_data, interpretations, output_dir)
         if report_path:
             return dcc.send_file(report_path)
     return None
+
 
 @app.callback(
     [Output('data-folder-path', 'value'),
@@ -923,3 +1074,4 @@ def load_sample_data(n_clicks):
         logger.info("Sample data mode activated.")
         return "Using internal sample data", True
     return dash.no_update
+

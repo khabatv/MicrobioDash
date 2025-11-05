@@ -18,44 +18,39 @@ from .config import logger
 # ---------- Publication style helpers ----------
 from plotly.colors import qualitative as qual
 
-# Color palettes (colorblind-friendly first)
-_TOL_12 = [
-    "#332288", "#117733", "#44AA99", "#88CCEE",
-    "#DDCC77", "#CC6677", "#AA4499", "#882255",
-    "#999933", "#661100", "#6699CC", "#AA4466",
-]
-
-# Build a 20-color set using Plotly's Tableau-inspired sets that *do* exist
-_TABLEAU_20 = px.colors.qualitative.T10 + px.colors.qualitative.G10  # 10 + 10 = 20
+import plotly.colors as pc
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
 
 def get_pub_palette(n: int) -> list:
     """
-    Return n distinct colors, prioritizing colorblind-safe sets and avoiding repeats
-    until necessary.
+    Returns up to `n` distinct, publication-quality colors.
+    Automatically expands if more colors are needed.
     """
-    bank = (
-        _TOL_12
-        + px.colors.qualitative.Safe
-        + px.colors.qualitative.Vivid
-        + px.colors.qualitative.T10
-        + px.colors.qualitative.G10
-        + px.colors.qualitative.Dark24
-        + px.colors.qualitative.Light24
+
+    # ✅ 1. Combine safe qualitative palettes from Plotly
+    base_palettes = (
+        pc.qualitative.Plotly
+        + pc.qualitative.D3
+        + pc.qualitative.G10
+        + pc.qualitative.Set3
+        + pc.qualitative.Light24
+        + pc.qualitative.Dark24
     )
 
-    out = []
-    for c in bank:
-        if c not in out:
-            out.append(c)
-        if len(out) >= n:
-            break
+    # Remove duplicates while preserving order
+    seen = set()
+    base_palettes = [c for c in base_palettes if not (c in seen or seen.add(c))]
 
-    # If still short (very many groups), repeat deterministically
-    if len(out) < n and len(out) > 0:
-        need = n - len(out)
-        out += (out * ((need // len(out)) + 1))[:need]
+    # ✅ 2. If enough colors exist, return subset
+    if n <= len(base_palettes):
+        return base_palettes[:n]
 
-    return out[:n]
+    # ✅ 3. Otherwise generate smooth extended palette from matplotlib colormap
+    cmap = plt.get_cmap("turbo")  # vivid and publication-safe
+    extra = [mcolors.to_hex(cmap(i / n)) for i in range(n)]
+    return extra
 
 def apply_pub_style(fig, portrait=True, base_font=16, legend_right=True,
                     width=None, height=None):
@@ -120,6 +115,10 @@ def _infer_group_order_from_meta(meta_df: pd.DataFrame, treat_col: str):
 
     # 3) fallback: first-seen order in metadata
     return list(pd.unique(s))
+def consistent_color_mapping(labels):
+    unique_labels = sorted(set(labels))
+    palette = get_pub_palette(len(unique_labels))
+    return dict(zip(unique_labels, palette))
 
 # -----------------------------------------------------------------------------
 def add_stat_annotations(fig, alpha_df, treatment_col, stats_df, group_order=None):
@@ -234,29 +233,28 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01, group_
         totals = grp.groupby(treatment_column)['Abundance'].transform('sum')
         grp['RelativeAbundance'] = grp['Abundance'] / totals
 
-        # Collapse rare Orders to 'Other' using mean across treatments
+        # Collapse rare Orders to 'Other'
         mean_by_order = grp.groupby('Order')['RelativeAbundance'].mean()
         rare_orders = mean_by_order[mean_by_order < threshold].index
         grp['Order'] = grp['Order'].where(~grp['Order'].isin(rare_orders), 'Other')
 
-        final_df = (grp.groupby([treatment_column, 'Order'])['RelativeAbundance']
-                        .sum().reset_index())
+        final_df = (
+            grp.groupby([treatment_column, 'Order'])['RelativeAbundance']
+               .sum().reset_index()
+        )
 
         # Category order for x-axis
         if group_order:
-            # keep only groups present in the data, in the specified order
             present = [g for g in group_order if g in final_df[treatment_column].unique()]
         else:
-            # first-seen order in metadata if it’s categorical & ordered
             s = meta[treatment_column]
             if pd.api.types.is_categorical_dtype(s) and getattr(s.cat, "ordered", False):
                 present = [g for g in s.cat.categories if g in final_df[treatment_column].unique()]
             else:
                 present = list(dict.fromkeys(final_df[treatment_column].astype(str).tolist()))
 
-        # Palette: one color per Order
-        n_colors = final_df['Order'].nunique()
-        palette  = get_pub_palette(n_colors)
+        # ✅ consistent colors per Order
+        color_map = consistent_color_mapping(final_df['Order'])
 
         fig = px.bar(
             final_df,
@@ -264,15 +262,14 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01, group_
             y='RelativeAbundance',
             color='Order',
             category_orders={treatment_column: present},
-            color_discrete_sequence=palette,
+            color_discrete_map=color_map,
             title=f"Mean Relative Abundance by Order (>{threshold*100:.0f}%)",
             height=700
         )
         fig.update_layout(
             xaxis_title=treatment_column,
             yaxis_title="Mean Relative Abundance",
-            yaxis_tickformat='.0%',
-            legend=dict(orientation="v", yanchor="middle", y=-0.25, xanchor="center", x=0.5),
+            yaxis_tickformat='.0%'
         )
         apply_pub_style(fig, portrait=True, base_font=16)
         return fig
@@ -330,22 +327,21 @@ def plot_abundance_by_taxlevel(ps1_object, treatment_column, tax_level="Genus", 
         # Palette: one color per displayed taxon
         n_colors = final_df[tax_level].nunique()
         palette  = get_pub_palette(n_colors)
-
+        color_map = consistent_color_mapping(final_df[tax_level])
         fig = px.bar(
             final_df,
             x=treatment_column,
             y='RelativeAbundance',
             color=tax_level,
             category_orders={treatment_column: present},
-            color_discrete_sequence=palette,
+            color_discrete_map=color_map,
             title=f"Mean Relative Abundance by {tax_level} (>{threshold*100:.0f}%)",
             height=700
         )
         fig.update_layout(
             xaxis_title=treatment_column,
             yaxis_title="Mean Relative Abundance",
-            yaxis_tickformat='.0%',
-            legend=dict(orientation="v", yanchor="middle", y=-0.25, xanchor="center", x=0.5),
+            yaxis_tickformat='.0%'
         )
         apply_pub_style(fig, portrait=True, base_font=16)
         return fig

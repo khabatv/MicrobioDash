@@ -1,6 +1,7 @@
 
 import pandas as pd
 import numpy as np
+import patsy
 # --- Compatibility shim for NumPy < 2.0 (scikit-bio expects np.isdtype) ---
 if not hasattr(np, "isdtype"):
     def _np_isdtype(dt, kind):
@@ -83,86 +84,98 @@ def _gower_center(D):
     n = D.shape[0]
     J = np.eye(n) - np.ones((n, n))/n
     return -0.5 * (J @ D2 @ J)
+def valid_interaction(meta, a, b, min_levels=2, require_replication=True):
+    """
+    Return True if both a and b exist and have enough crossing for an interaction.
+    If require_replication=True, at least one (a,b) combination must appear >=2 times.
+    """
+    if a not in meta.columns or b not in meta.columns:
+        return False
 
-def _onehot_design(metadata_df, cols, level_map=None):
-    """
-    Build a design matrix X (without intercept).
-    - Categorical columns: one-hot with drop_first=True (treatment coding).
-      Optional 'level_map' lets you enforce specific level order per column.
-    - Numeric columns: included as is (float).
-    Returns X (n x p), df_per_term (dict), and per-term column slices.
-    """
-    mats = []
+    df = meta[[a, b]].dropna()
+    if df[a].nunique() < min_levels or df[b].nunique() < min_levels:
+        return False
+
+    cross_tab = df.groupby([a, b]).size()
+    if require_replication and not (cross_tab >= 2).any():
+        return False
+
+    return True
+
+
+from sklearn.preprocessing import OneHotEncoder
+
+def _simple_design(metadata_df, factors):
+    """One-hot encode each factor separately, with intercept."""
+    enc = OneHotEncoder(drop='first', sparse_output=False)
+    X = enc.fit_transform(metadata_df[factors])
+    cols = enc.get_feature_names_out(factors)
+    X = np.column_stack([np.ones(X.shape[0]), X])  # intercept
+    df_per_term = {f: len(metadata_df[f].unique()) - 1 for f in factors}
+    # build slices per factor
+    start = 1
     term_slices = {}
-    df_per_term = {}
-    start = 0
-
-    for col in cols:
-        x = metadata_df[col]
-        if (pd.api.types.is_categorical_dtype(x) or x.dtype == object):
-            if level_map and col in level_map:
-                # enforce level order
-                cats = level_map[col]
-                x = pd.Categorical(x, categories=cats, ordered=True)
-            else:
-                # ensure deterministic order (sorted unique)
-                x = pd.Categorical(x, categories=pd.unique(x.astype(str)), ordered=True)
-
-            M = pd.get_dummies(x, drop_first=True)
-            block = M.to_numpy(dtype=float, copy=False)
-            p = block.shape[1]  # Df for this term
-            if p == 0:
-                # single level -> contributes nothing (skip)
-                term_slices[col] = slice(start, start)
-                df_per_term[col] = 0
-                continue
-            mats.append(block)
-            term_slices[col] = slice(start, start + p)
-            df_per_term[col] = p
-            start += p
-        else:
-            block = x.to_numpy(dtype=float).reshape(-1, 1)
-            mats.append(block)
-            term_slices[col] = slice(start, start + 1)
-            df_per_term[col] = 1
-            start += 1
-
-    X = np.concatenate(mats, axis=0 if len(mats) and mats[0].ndim == 1 else 1) if mats else np.zeros((len(metadata_df), 0))
-    if X.ndim == 1:
-        X = X.reshape(-1, 1)
+    for f in factors:
+        ncols = df_per_term[f]
+        term_slices[f] = slice(start, start + ncols)
+        start += ncols
     return X, df_per_term, term_slices
 
+
 def _proj_hat(X):
-    """
-    Return projection (hat) matrix H for design X with an intercept.
-    H = X_ (X_' X_)^+ X_'  where X_ = [1, X]
-    Uses pinv for numerical stability.
-    """
-    n = X.shape[0]
-    X_ = np.column_stack([np.ones((n, 1)), X])
-    XtX_inv = np.linalg.pinv(X_.T @ X_, rcond=1e-12)
-    H = X_ @ XtX_inv @ X_.T
-    return H
+    """Return projection (hat) matrix H = X(X'X)^+X' using pseudo-inverse for stability."""
+    XtX_inv = np.linalg.pinv(X.T @ X, rcond=1e-12)
+    return X @ XtX_inv @ X.T
+
 
 def _perm_indices_within_strata(strata_series, rng):
-    """
-    Produce a permutation of indices that shuffles within each stratum (block).
-    """
-    codes = pd.Series(strata_series).astype('category').cat.codes.to_numpy()
+    """Produce permutation indices that shuffle within each stratum (block)."""
+    codes = pd.Series(strata_series).astype("category").cat.codes.to_numpy()
     perm = np.arange(len(codes))
     for code in np.unique(codes):
         idx = np.where(codes == code)[0]
         perm[idx] = rng.permutation(idx)
     return perm
 
+
 # ------------------------------
-# Core: Multifactor PERMANOVA (marginal tests via Freedman–Lane)
+# Design matrix with interactions (using patsy)
+# ------------------------------
+
+def _design_from_formula(metadata_df, factors, interactions=None, level_map=None):
+    """
+    Build a design matrix using patsy (supports interactions and contrasts).
+    Only RHS is modeled (no explicit outcome), since PERMANOVA uses the distance matrix as Y.
+    """
+    if interactions is None:
+        interactions = []
+
+    # Combine main effects and interaction terms into RHS
+    rhs_terms = list(factors) + list(interactions)
+    rhs = " + ".join(rhs_terms)  # e.g. "Cultivar + Media + Cultivar:Media"
+
+    # '0 +' → no intercept; we handle intercept in _proj_hat
+    formula = "0 + " + rhs
+
+    # Design matrix only (no Y)
+    X = patsy.dmatrix(formula, metadata_df, return_type="dataframe")
+
+    # term_name_slices maps each term to the columns for that term
+    term_slices = X.design_info.term_name_slices
+    df_per_term = {term: sl.stop - sl.start for term, sl in term_slices.items()}
+
+    return X.to_numpy(), df_per_term, term_slices
+
+
+# ------------------------------
+# Core: Multifactor PERMANOVA (Freedman–Lane, with interactions)
 # ------------------------------
 
 def permanova_marginal(
     distance_matrix,
     metadata_df,
     factors,
+    interactions=None,
     permutations=999,
     strata=None,
     random_state=None,
@@ -178,7 +191,9 @@ def permanova_marginal(
     metadata_df : pandas.DataFrame
         Rows indexed by sample IDs (will be aligned to distance if DataFrame was passed).
     factors : list[str]
-        Column names in metadata_df to include in the model.
+        Column names in metadata_df to include in the model (main effects).
+    interactions : list[str], optional
+        Interaction terms in patsy syntax, e.g. ["Cultivar:Media", "Media:Cultivation_Unit"].
     permutations : int, default 999
         Number of permutations for p-values.
     strata : array-like or pandas Series, optional
@@ -186,8 +201,7 @@ def permanova_marginal(
     random_state : int or np.random.Generator, optional
         Seed or RNG for reproducibility.
     level_map : dict[str, list], optional
-        Dict mapping factor -> ordered list of levels (for categorical factors),
-        to enforce specific reference/contrast coding (match R if needed).
+        (kept for compatibility; not used directly here)
 
     Returns
     -------
@@ -195,88 +209,124 @@ def permanova_marginal(
         term, Df, SS, R2, F, p_value
         (sorted by R2 descending)
     """
-    # Align inputs
+    # Align inputs (same as before)
     D, metadata_df = _ensure_numpy_distance(distance_matrix, metadata_df)
     if metadata_df is None:
         raise ValueError("metadata_df must be provided when passing a numpy distance matrix.")
 
-    # Drop missing rows in factors (like R does)
-    metadata_df, mask = _drop_missing(metadata_df, factors)
+    # Drop rows with NA in any factor or interaction variables
+    all_terms = list(factors)
+    if interactions:
+        # extract base factors from interaction strings, e.g. "A:B" -> ["A", "B"]
+        for inter in interactions:
+            for part in inter.split(":"):
+                if part not in all_terms:
+                    all_terms.append(part)
+
+    metadata_df, mask = _drop_missing(metadata_df, all_terms)
     if isinstance(distance_matrix, pd.DataFrame):
         D = D[mask.values, :][:, mask.values]
-    else:
-        # assume already aligned; user must drop rows in D too if there are NAs
-        pass
 
     n = D.shape[0]
     if n != len(metadata_df):
         raise ValueError("Distance matrix and metadata row counts do not match after NA dropping.")
 
-    # Build design
-    X_full, df_per_term, term_slices = _onehot_design(metadata_df, factors, level_map=level_map)
+    # Build design matrix with patsy (no intercept; _proj_hat adds the intercept)
+    X_full, df_per_term, term_slices = _design_from_formula(
+        metadata_df=metadata_df,
+        factors=factors,
+        interactions=interactions or [],
+        level_map=level_map,
+    )
 
-    # Edge case: if all columns ended up empty (e.g., single-level factors only)
     if X_full.shape[1] == 0:
         raise ValueError("All factors collapsed (single level). No testable terms.")
 
-    # Projections and Gower-centered matrix
+    # Gower-centered distance matrix
     G = _gower_center(D)
     SS_tot = np.trace(G)
 
+    # Projection for full model
     H_full = _proj_hat(X_full)
+    I = np.eye(n)
+
+    # Residual SS for full model
+    E_full = (I - H_full) @ G @ (I - H_full)
+    SSE_full = np.trace(E_full)
+
+    # Residual df: n - rank(X_full with intercept)
+    X_with_int = np.column_stack([np.ones((n, 1)), X_full])
+    rank_full = np.linalg.matrix_rank(X_with_int)
+    df_resid = n - rank_full
+    if df_resid < 1:
+        raise ValueError("Residual degrees of freedom < 1. Model is saturated.")
 
     rng = np.random.default_rng(random_state)
 
-    # Prepare strata as Series aligned to metadata if provided
+    # Prepare strata if provided
     strata_series = None
     if strata is not None:
         if isinstance(strata, (pd.Series, pd.Categorical)):
-            strata_series = strata.loc[metadata_df.index] if hasattr(strata, "index") else pd.Series(strata, index=metadata_df.index)
+            strata_series = (
+                strata.loc[metadata_df.index]
+                if hasattr(strata, "index")
+                else pd.Series(strata, index=metadata_df.index)
+            )
         else:
-            # assume array-like aligned to metadata_df
             strata_series = pd.Series(strata, index=metadata_df.index)
 
     results = []
 
-    # Precompute residual DoF
-    df_resid = n - (X_full.shape[1] + 1)  # +1 for intercept
-    if df_resid < 1:
-        raise ValueError("Residual degrees of freedom < 1. Model is saturated.")
-
-    # For each term, compute marginal effect (full vs. reduced model without that term)
-    for term in factors:
+    # For each term, compute marginal effect via reduced vs full model
+    # Note: term names include interactions (e.g. "Cultivar:Media") from _design_from_formula
+    for term, sl in term_slices.items():
         p_term = df_per_term.get(term, 0)
         if p_term == 0:
-            # no degrees for this term (e.g., only one level) -> skip with zeros
-            results.append({"term": term, "Df": 0, "SS": 0.0, "R2": 0.0, "F": np.nan, "p_value": 1.0})
+            results.append(
+                {
+                    "term": term,
+                    "Df": 0,
+                    "SS": 0.0,
+                    "R2": 0.0,
+                    "F": np.nan,
+                    "p_value": 1.0,
+                }
+            )
             continue
 
-        # Reduced design: drop columns of this term
+        # Reduced design: drop columns corresponding to this term
         cols_keep = np.ones(X_full.shape[1], dtype=bool)
-        cols_keep[term_slices[term]] = False
-        X_others = X_full[:, cols_keep] if cols_keep.any() else np.zeros((n, 0))
-        H_others = _proj_hat(X_others) if X_others.shape[1] > 0 else np.zeros((n, n))
+        cols_keep[sl] = False
+        X_red = X_full[:, cols_keep] if cols_keep.any() else np.zeros((n, 0))
 
-        # Sums of squares
-        SS_full   = np.trace(H_full   @ G @ H_full)
-        SS_others = np.trace(H_others @ G @ H_others)
-        SS_term   = SS_full - SS_others
+        if X_red.shape[1] > 0:
+            H_red = _proj_hat(X_red)
+            E_red = (I - H_red) @ G @ (I - H_red)
+            SSE_red = np.trace(E_red)
+        else:
+            # Reduced model with only intercept
+            H_red = np.ones((n, n)) / n
+            E_red = (I - H_red) @ G @ (I - H_red)
+            SSE_red = np.trace(E_red)
 
-        MS_term = SS_term / p_term
-        MS_res  = (SS_tot - SS_full) / df_resid
-        F_obs   = MS_term / MS_res if MS_res > 0 else np.inf
-        R2      = SS_term / SS_tot if SS_tot > 0 else np.nan
+        # Partial SS for this term
+        SS_term = SSE_red - SSE_full
+        # Numerical safety: tiny negative values -> 0
+        if SS_term < 0 and abs(SS_term) < 1e-10 * SS_tot:
+            SS_term = 0.0
+
+        MS_term = SS_term / p_term if p_term > 0 else np.nan
+        MS_res = SSE_full / df_resid if df_resid > 0 else np.nan
+        F_obs = MS_term / MS_res if (MS_res is not None and MS_res > 0) else np.inf
+        R2 = SS_term / SS_tot if SS_tot > 0 else np.nan
 
         # Freedman–Lane permutations under reduced model
         # Residualized G under reduced model
-        I = np.eye(n)
-        R = (I - H_others) @ G @ (I - H_others)
+        R = (I - H_red) @ G @ (I - H_red)
 
-        # Spectral decomposition to get residual coordinates for shuffling
         eigvals, eigvecs = np.linalg.eigh(R)
         pos = eigvals > 1e-12
         if not np.any(pos):
-            # If residual space is nearly zero, permutations won't change anything
             p_value = 1.0
         else:
             U = eigvecs[:, pos] * np.sqrt(eigvals[pos])
@@ -288,33 +338,50 @@ def permanova_marginal(
                 else:
                     perm = _perm_indices_within_strata(strata_series, rng)
 
-                U_perm = U[perm, :]                 # permute residual coords
-                G_star = U_perm @ U_perm.T          # reconstructed permuted residual
+                U_perm = U[perm, :]
+                G_star = U_perm @ U_perm.T
 
-                # Recompose permuted G under the alternative:
-                G_perm = (H_others @ G @ H_others) + ((I - H_others) @ G_star @ (I - H_others))
+                # Permuted G under the alternative (following Freedman–Lane idea)
+                G_perm = H_red @ G @ H_red + (I - H_red) @ G_star @ (I - H_red)
 
-                SS_full_p   = np.trace(H_full   @ G_perm @ H_full)
-                SS_others_p = np.trace(H_others @ G_perm @ H_others)
-                SS_term_p   = SS_full_p - SS_others_p
+                # Recompute SSE for reduced and full models on permuted G
+                E_full_p = (I - H_full) @ G_perm @ (I - H_full)
+                SSE_full_p = np.trace(E_full_p)
 
-                MS_term_p = SS_term_p / p_term
-                MS_res_p  = (SS_tot - SS_full_p) / df_resid
-                F_p       = MS_term_p / MS_res_p if MS_res_p > 0 else np.inf
+                if X_red.shape[1] > 0:
+                    E_red_p = (I - H_red) @ G_perm @ (I - H_red)
+                    SSE_red_p = np.trace(E_red_p)
+                else:
+                    E_red_p = (I - H_red) @ G_perm @ (I - H_red)
+                    SSE_red_p = np.trace(E_red_p)
+
+                SS_term_p = SSE_red_p - SSE_full_p
+                if SS_term_p < 0 and abs(SS_term_p) < 1e-10 * SS_tot:
+                    SS_term_p = 0.0
+
+                MS_term_p = SS_term_p / p_term if p_term > 0 else np.nan
+                MS_res_p = SSE_full_p / df_resid if df_resid > 0 else np.nan
+                F_p = MS_term_p / MS_res_p if (MS_res_p is not None and MS_res_p > 0) else np.inf
 
                 if F_p >= F_obs:
                     exceed += 1
 
-            # add-one correction
             p_value = (exceed + 1) / (permutations + 1)
 
-        results.append({"term": term, "Df": int(p_term), "SS": float(SS_term), "R2": float(R2), "F": float(F_obs), "p_value": float(p_value)})
+        results.append(
+            {
+                "term": term,
+                "Df": int(p_term),
+                "SS": float(SS_term),
+                "R2": float(R2),
+                "F": float(F_obs),
+                "p_value": float(p_value),
+            }
+        )
 
     out = pd.DataFrame(results).sort_values("R2", ascending=False).reset_index(drop=True)
     return out
 
-# ------------------------------
-# (Optional) quick permdisp (betadisper) analog
 # ------------------------------
 
 def betadisper_anova(distance_matrix, groups):
@@ -386,7 +453,60 @@ def betadisper_anova(distance_matrix, groups):
         "stat": ["F", "p_value"],
         "value": [float(F_obs), float(p_value)]
     }), pd.DataFrame({"group": levels, "mean_distance": [dists[codes == i].mean() for i in range(k)]})
+def add_interactions(metadata_df, spec, center_numeric=True):
+    """
+    spec: list of tuples describing interactions, e.g.
+      [("Media","Cultivar"), ("Media","Cultivation_Unit"), ("Media","TIME_D")]
+    Returns: (metadata_with_interactions, list_of_new_column_names)
+    """
+    df = metadata_df.copy()
+    new_cols = []
 
+    def _ensure_cat(s):
+        return s.astype("category") if not pd.api.types.is_categorical_dtype(s) else s
+
+    def _center(x):
+        x = x.astype(float)
+        return x - x.mean() if center_numeric else x
+
+    for a, b in spec:
+        sa, sb = df[a], df[b]
+        is_num_a = pd.api.types.is_numeric_dtype(sa)
+        is_num_b = pd.api.types.is_numeric_dtype(sb)
+
+        # cat × cat
+        if not is_num_a and not is_num_b:
+            sa = _ensure_cat(sa)
+            sb = _ensure_cat(sb)
+            col = f"{a}_x_{b}"
+            df[col] = sa.astype(str) + ":" + sb.astype(str)
+            df[col] = df[col].astype("category")
+            new_cols.append(col)
+
+        # cat × num or num × cat
+        elif (not is_num_a and is_num_b) or (is_num_a and not is_num_b):
+            if not is_num_a:
+                sc, xn, cname, nname = sa, sb, a, b
+            else:
+                sc, xn, cname, nname = sb, sa, b, a
+            sc = _ensure_cat(sc)
+            xn = _center(xn)
+            for lvl in sc.cat.categories:
+                ind_col = f"{cname}[{lvl}]"
+                int_col = f"{cname}[{lvl}]_x_{nname}"
+                df[ind_col] = (sc == lvl).astype(int)
+                df[int_col] = df[ind_col] * xn
+                new_cols.extend([ind_col, int_col])
+
+        # num × num
+        else:
+            xa = _center(sa)
+            xb = _center(sb)
+            col = f"{a}_x_{b}"
+            df[col] = xa * xb
+            new_cols.append(col)
+
+    return df, new_cols
 def run_differential_abundance(ps1_object, treatment_column):
     try:
         logger.info("Running differential abundance analysis with Kruskal-Wallis and Dunn's post-hoc test...")
