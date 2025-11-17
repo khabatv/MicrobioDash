@@ -7,7 +7,6 @@ import dash
 from dash import dcc, html, Input, Output, State, ctx
 import plotly.graph_objects as go
 import plotly.express as px
-
 # Internal module imports
 from .config import logger
 from .data.sample_data import sample_metadata_df, sample_seqtab, sample_taxa
@@ -20,7 +19,7 @@ from .analysis import (
 from .statistics import (perform_pairwise_alpha_tests, permanova_marginal, betadisper_anova, run_differential_abundance, 
                          run_indicator_species, run_mixed_effect_model, run_pymc_zinb_mixed_model, run_ancom_skbio, valid_interaction)
 from .plotting import (add_stat_annotations, plot_phylogenetic_tree, plot_abundance_by_order, plot_abundance_by_taxlevel, plot_ancom_clr_heatmap, 
-                       plot_lme_results, format_lme_results_for_display)
+                       plot_lme_results, format_lme_results_for_display,_apply_labels_and_order, consistent_color_mapping)
 from .reporting import generate_pdf_report
 from .utils import fill_taxonomy_forward
 from dash import no_update
@@ -85,6 +84,35 @@ dcc.Dropdown(
     ],
     value='kw',
 ),
+
+                        html.Summary("PERMANOVA & PERMDISP Settings"),
+                        html.Div([
+                            html.P("Select factors for PERMANOVA (main effects):"),
+                            dcc.Dropdown(
+                                id='permanova-factors-dropdown',
+                                multi=True,
+                                placeholder="Select factors (e.g., Substrate, Media)"
+                            ),
+                            html.P("Enter interaction terms (comma-separated, e.g., Cultivar:Media):"),
+                            dcc.Input(
+                                id='permanova-interactions-input',
+                                type='text',
+                                value='',
+                                placeholder="Cultivar:Media, Media:TIME_D"
+                            ),
+                            html.P("Select Strata (blocking factor, optional):"),
+                            dcc.Dropdown(
+                                id='permanova-strata-dropdown',
+                                placeholder="Select a blocking factor (e.g., Run)"
+                            ),
+                            html.P("Number of permutations:"),
+                            dcc.Input(
+                                id='permanova-permutations',
+                                type='number',
+                                value=999
+                            ),
+                        ], style={'padding': '10px', 'border': '1px solid #eee', 'borderRadius': '5px', 'marginBottom': '10px'}),
+
                 html.H4("Mixed-Effect Model"),
                 html.Label("Model Type:"),
                 dcc.Dropdown(id='model-type-dropdown', options=[
@@ -150,7 +178,7 @@ def _infer_group_order(meta_df: pd.DataFrame, treat_col: str) -> list:
     if pd.api.types.is_categorical_dtype(s) and getattr(s.cat, "ordered", False):
         return list(s.cat.categories)
 
-    # (b) look for a numeric “order” column per sample, then sort groups by its min
+    # (b) look for a numeric order column ...
     for c in [f"{treat_col}_order", "PlotOrder", "GroupOrder", "order", "Order", "Run", "Day", "Time"]:
         if c in meta_df.columns:
             ords = pd.to_numeric(meta_df[c], errors="coerce")
@@ -160,8 +188,9 @@ def _infer_group_order(meta_df: pd.DataFrame, treat_col: str) -> list:
                                .sort_values()
                                .index.tolist())
 
-    # (c) fallback: first-seen order in metadata
-    return list(dict.fromkeys(s.astype(str).tolist()))
+    # (c) fallback: **alphabetical**
+    return sorted(pd.unique(s.astype(str)))
+
 def _pick_multifactor_terms(
     meta_df: pd.DataFrame,
     extra: Optional[List[str]] = None,
@@ -201,6 +230,73 @@ def _pick_multifactor_terms(
         cleaned.append(t)
     return cleaned
 # --- Callbacks ---
+
+@app.callback(
+    [Output('permanova-factors-dropdown', 'options'),
+     Output('permanova-factors-dropdown', 'value'),
+     Output('permanova-strata-dropdown', 'options'),
+     Output('permanova-strata-dropdown', 'value'),
+     Output('random-effect-cols', 'options')], # Also update random effect options
+    [Input('load-sample-data', 'n_clicks'),
+     Input('list-files-button', 'n_clicks')],
+    State('data-folder-path', 'value'),
+    prevent_initial_call=False # Allow initial call to populate if data exists
+)
+def populate_permanova_and_random_effect_options(n_sample, n_list, data_path):
+    # This logic is similar to populate_subset_options, but we need to ensure
+    # metadata is loaded to infer column names.
+    meta_df = pd.DataFrame() # Default empty
+
+    try:
+        if 'sample_data_mode' in global_data or (n_sample > 0 and ctx.triggered_id == 'load-sample-data'):
+            meta_df = sample_metadata_df.copy()
+            logger.info("Populating PERMANOVA/Random Effect dropdowns from sample metadata.")
+        elif data_path and os.path.isdir(data_path):
+            files = os.listdir(data_path)
+            meta_file = next((f for f in files if f.lower().endswith(('.csv', '.tsv', '.txt'))), None)
+            if meta_file:
+                meta_path = os.path.join(data_path, meta_file)
+                sep = '\t' if os.path.splitext(meta_file)[1].lower() in ('.tsv', '.txt') else ','
+                meta_df = pd.read_csv(meta_path, sep=sep, index_col=0)
+                logger.info(f"Populating PERMANOVA/Random Effect dropdowns from {meta_file}.")
+
+        if meta_df.empty:
+            return [], [], [], None, [] # Empty options
+
+        # Filter out high-cardinality columns for factors/strata
+        available_cols = []
+        for col in meta_df.columns:
+            s = meta_df[col].dropna()
+            # Must have at least two unique values
+            if s.nunique() < 2:
+                continue
+            # Skip very high cardinality for categorical factors (e.g., unique identifiers)
+            if not pd.api.types.is_numeric_dtype(s) and s.nunique() > (len(s) * 0.8): # Heuristic for too many unique values
+                 continue
+            available_cols.append({'label': col, 'value': col})
+
+        # Pre-select a few common factors if they exist in metadata
+        default_factors = [c for c in ["Substrate", "Media", "TIME_D", "Cultivar"] if {'label': c, 'value': c} in available_cols]
+        # Pre-select 'Run' or similar for strata if it exists
+        default_strata = next((c['value'] for c in available_cols if c['value'].lower() in ["run", "block"]), None)
+
+        # For random effect columns, allow any reasonable categorical or numeric column
+        random_effect_options = []
+        for col in meta_df.columns:
+            s = meta_df[col].dropna()
+            if s.nunique() >= 1: # Can be 1 if it's a random effect, but generally >1
+                random_effect_options.append({'label': col, 'value': col})
+
+        return (
+            available_cols, default_factors,
+            available_cols, default_strata,
+            random_effect_options
+        )
+
+    except Exception as e:
+        logger.error(f"Error populating PERMANOVA dropdowns: {e}", exc_info=True)
+        return [], [], [], None, [] # Return empty on error
+
 
 @app.callback(
     Output('file-listing-output', 'children'),
@@ -311,13 +407,18 @@ def populate_subset_options(treat_col, n_sample, n_list, data_path):
         State('mem-reference-group-input', 'value'),
         State('show-insignificant', 'value'),
         State('force_features', 'value'),
-        State('da-method', 'value'),   
+        State('da-method', 'value'),
+        State('permanova-factors-dropdown', 'value'),
+        State('permanova-interactions-input', 'value'),
+        State('permanova-strata-dropdown', 'value'),
+        State('permanova-permutations', 'value'),
     ],
     prevent_initial_call=True,
 )
 def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trunc_r, max_ee, treat_col,
                       subset, top_asvs, background, silva_content, model_type, mem_treat, time_col,
-                      rand_eff, analysis_lvl, mem_top_n, mem_ref, mem_show_insig, force_feat, da_method):
+                      rand_eff, analysis_lvl, mem_top_n, mem_ref, mem_show_insig, force_feat, da_method,
+                      permanova_selected_factors, permanova_interaction_input, permanova_selected_strata, permanova_num_permutations):
     if n_clicks == 0:
         empty_fig = go.Figure()
         empty_div = html.Div()
@@ -424,14 +525,45 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
 
         # --- CORE ANALYSIS ---
         ps1_full = create_phyloseq_object(seqtab, taxa_filled, meta_df)
+        logger.info(f"Before subsetting: {ps1_full['asv'].shape[1]} Samples, Gruppen: {sorted(ps1_full['meta'][treat_col].unique())}")
+        if subset:
+            logger.info(f"Subset requested: {subset}")
+        else:
+            logger.info("No subset requested")
         ps1 = ps1_full
         if subset:
-            meta_subset = ps1_full['meta'][ps1_full['meta'][treat_col].isin(subset)]
+            logger.info(f"Subsetting requested: {subset} (Typ: {[type(x).__name__ for x in subset]})")
+            logger.info(f"Available levels in '{treat_col}': {sorted(ps1_full['meta'][treat_col].unique())}")
+
+            subset_str = [str(s).strip() for s in subset]
+            meta_str = ps1_full['meta'][treat_col].astype(str).str.strip()
+
+            mask = meta_str.isin(subset_str)
+            matched_samples = mask.sum()
+
+            logger.info(f"→ {matched_samples} samples matched to {subset_str}")
+
+            if matched_samples == 0:
+                raise ValueError(
+                    f"SUBSETTING FAILED\n"
+                    f"Requested subset: {subset}\n"
+                    f"VSaved as CSV: {sorted(ps1_full['meta'][treat_col].astype(str).unique())}\n"
+                )
+
+            if matched_samples < 2:
+                raise ValueError(f"Only {matched_samples} samples found. Insufficient sample size for analysis.")
+
+            # Nur gültige Samples behalten
+            valid_idx = ps1_full['meta'].index[mask]
             ps1 = {
-                'asv': ps1_full['asv'].loc[:, meta_subset.index],
+                'asv': ps1_full['asv'].loc[:, valid_idx],
                 'tax': ps1_full['tax'],
-                'meta': meta_subset
+                'meta': ps1_full['meta'].loc[valid_idx]
             }
+
+            logger.info(f"SUBSETTING SUCCESFULL → {len(valid_idx)} samples included in subset")
+        else:
+            logger.info("No subset requested")
         global_data['ps1'] = ps1
 
                # ---- Consistent group order (from metadata) ----
@@ -440,9 +572,28 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
             ps1['meta'][treat_col], categories=group_order, ordered=True
         )
         global_data['group_order'] = group_order
+        
+        # === LABEL/ORDER NORMALIZATION (build once) ===
+        # use treat_col directly, but renamed to "Group"
+        df_groups = ps1['meta'][[treat_col]].copy()
+        df_groups.rename(columns={treat_col: "Group"}, inplace=True)
+        
+        _, present_order, label_map = _apply_labels_and_order(
+            df=df_groups,
+            col="Group",
+            meta=df_groups,
+            order_mode="custom",          # << use the known group_order
+            custom_order=group_order,
+            label_map=None,
+            auto_compact=True
+        )
+        
+        pretty = lambda s: label_map.get(str(s), str(s))
+        color_map_groups = consistent_color_mapping(present_order, order=present_order)
 
-        # palette for groups
-        palette_groups = get_pub_palette(len(group_order))
+
+
+
         # --- Total reads per treatment group (sum) ---
         reads_per_sample = seqtab.sum(axis=1).rename("Reads")
         reads_by_group = (
@@ -453,25 +604,26 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
      .sum()
      .reset_index()
  )
-
  # keep same order as everywhere else
-        order_for_reads = [g for g in group_order if g in reads_by_group[treat_col].unique()]
+        reads_by_group['GroupPretty'] = reads_by_group[treat_col].astype(str).map(pretty)
 
         total_reads_fig = px.bar(
-     reads_by_group,
-     x=treat_col, y="Reads",
-     category_orders={treat_col: order_for_reads},
-     text="Reads"
- )
+            reads_by_group,
+            x='GroupPretty', y="Reads",
+            category_orders={'GroupPretty': present_order},
+            color='GroupPretty',
+            color_discrete_map=color_map_groups,
+            text="Reads",
+            title="Total Reads per Treatment Group",
+        )
         total_reads_fig.update_traces(texttemplate="%{text:,}", textposition="outside", cliponaxis=False)
         total_reads_fig.update_layout(
-     title="Total Reads per Treatment Group",
-     xaxis_title=treat_col,
-     yaxis_title="Total reads",
-     showlegend=False,
-     width=900, height=700,
-     margin=dict(l=80, r=40, t=60, b=100),
- )
+            xaxis_title=treat_col,
+            yaxis_title="Total reads",
+            showlegend=False,
+            width=900, height=700,
+            margin=dict(l=80, r=40, t=60, b=100),
+        )
         total_reads_fig.update_yaxes(tickformat=",")
         apply_pub_style(total_reads_fig, portrait=True, base_font=16)
 
@@ -481,27 +633,46 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         ps1_meta[treat_col] = pd.Categorical(
             ps1_meta[treat_col], categories=group_order, ordered=True
         )
-
+        ps1_meta['GroupPretty'] = ps1_meta[treat_col].astype(str).map(pretty)
+        
         alpha_fig = px.violin(
             ps1_meta,
-            x=treat_col,
+            x='GroupPretty',
             y='Shannon',
             box=True,
             points='all',
             title=f"Shannon Diversity by {treat_col}",
-            category_orders={treat_col: group_order},
-            color=treat_col,
-            color_discrete_sequence=palette_groups,
+            category_orders={'GroupPretty': present_order},
+            color='GroupPretty',
+            color_discrete_map=color_map_groups,
         )
-        alpha_fig.update_xaxes(categoryorder="array", categoryarray=group_order)
+        alpha_fig.update_xaxes(categoryorder="array", categoryarray=present_order)
         apply_pub_style(alpha_fig, portrait=True, base_font=16)
 
         stats_df = perform_pairwise_alpha_tests(ps1_meta, treat_col)
         if not stats_df.empty:
+            # Map group names to pretty labels
+            stats_df_pretty = stats_df.copy()
+            stats_df_pretty['group1'] = stats_df_pretty['group1'].map(pretty)
+            stats_df_pretty['group2'] = stats_df_pretty['group2'].map(pretty)
+        
+            # Call with GroupPretty + pretty order
             try:
-                alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df, group_order=group_order)
+                alpha_fig = add_stat_annotations(
+                    alpha_fig,
+                    ps1_meta.assign(GroupPretty=ps1_meta[treat_col].astype(str).map(pretty)),
+                    'GroupPretty',
+                    stats_df_pretty,
+                    group_order=present_order
+                )
             except TypeError:
-                alpha_fig = add_stat_annotations(alpha_fig, ps1_meta, treat_col, stats_df)
+                alpha_fig = add_stat_annotations(
+                    alpha_fig,
+                    ps1_meta.assign(GroupPretty=ps1_meta[treat_col].astype(str).map(pretty)),
+                    'GroupPretty',
+                    stats_df_pretty
+                )
+
 
                 global_data['alpha_fig'] = alpha_fig
 
@@ -520,19 +691,27 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
             ordered=True,
         )
     # ---- (Always) build ordination figures ----
+        if treat_col in pcoa_scores.columns:
+    # ensure clean copy and consistent dtype
+            pcoa_scores[treat_col] = pcoa_scores[treat_col].astype(str)
+        else:
+            pcoa_scores = pcoa_scores.join(meta_rel[[treat_col]].astype(str))
+        pcoa_scores['GroupPretty'] = pcoa_scores[treat_col].astype(str).map(pretty)
+        
         pcoa_fig = px.scatter(
             pcoa_scores,
             x='PC1', y='PC2',
-            color=treat_col,
+            color='GroupPretty',
             title="PCoA (Bray-Curtis)",
             labels={
                 "PC1": f"PC1 ({pcoa_var['PC1']*100:.2f}%)",
                 "PC2": f"PC2 ({pcoa_var['PC2']*100:.2f}%)"
             },
-            category_orders={treat_col: group_order},
-            color_discrete_sequence=palette_groups,
+            category_orders={'GroupPretty': present_order},
+            color_discrete_map=color_map_groups,
         )
         apply_pub_style(pcoa_fig, portrait=True, base_font=16)
+
         global_data['pcoa_fig'] = pcoa_fig
     
         # Aitchison (CLR-Euclidean)
@@ -540,292 +719,245 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         var_vals = np.asarray(var_ait).ravel()
         pc1_lbl = f"PC1 ({(var_vals[0]*100):.2f}%)" if len(var_vals) > 0 else "PC1"
         pc2_lbl = f"PC2 ({(var_vals[1]*100):.2f}%)" if len(var_vals) > 1 else "PC2"
+        if treat_col in pcoa_ait_scores.columns:
+            pcoa_ait_scores[treat_col] = pcoa_ait_scores[treat_col].astype(str)
+        else:
+            pcoa_ait_scores = pcoa_ait_scores.join(meta_rel[[treat_col]].astype(str))
+        pcoa_ait_scores['GroupPretty'] = pcoa_ait_scores[treat_col].astype(str).map(pretty)
+        
         pcoa_ait_fig = px.scatter(
             pcoa_ait_scores,
             x=pcoa_ait_scores.columns[0], y=pcoa_ait_scores.columns[1],
-            color=treat_col,
+            color='GroupPretty',
             title="PCoA (Aitchison / CLR-Euclidean)",
             labels={
                 pcoa_ait_scores.columns[0]: pc1_lbl,
                 pcoa_ait_scores.columns[1]: pc2_lbl
             },
-            category_orders={treat_col: group_order},
-            color_discrete_sequence=palette_groups,
+            category_orders={'GroupPretty': present_order},
+            color_discrete_map=color_map_groups,
         )
         apply_pub_style(pcoa_ait_fig, portrait=True, base_font=16)
+
         # ---- PERMANOVA (multifactor, marginal tests) ----
-        # Base candidate factors (subset automatically by metadata)
-        base_terms = [
-            "Substrate", "Media", "TIME_D", "Run",
-            "Cultivar", "Cultivation_Unit"
-        ]
-        mf_terms = [c for c in base_terms if c in meta_rel.columns]
-
-        permanova_res = html.Div()  # default empty placeholder
-
+        permanova_res = html.Div("PERMANOVA lädt...", style={"color": "#666"})
+        
         try:
-            # Filter out factors with only 1 non-NA level
-            mf_terms = [c for c in mf_terms
-                        if meta_rel[c].nunique(dropna=True) > 1]
-
-            if len(mf_terms) >= 2:
-                meta_rel["TIME_D"] = pd.to_numeric(meta_rel["TIME_D"], errors="coerce")
-
-                for col in mf_terms:
-                    s = meta_rel[col]
-                    if col == "TIME_D":
-                        continue  # force continuous
-                    if (s.dtype == object) or (s.nunique(dropna=True) <= 10):
-                        meta_rel[col] = s.astype("category")
-
-                # case-insensitive lookup for "run" as a blocking factor
-                run_col = next(
-                    (c for c in meta_rel.columns if c.lower() == "run"),
-                    None,
+            # 1. Faktoren (Hauptfaktoren)
+            factors = permanova_selected_factors or _pick_multifactor_terms(meta_rel, extra=[treat_col])
+            factors = [f for f in factors if f in meta_rel.columns and meta_rel[f].nunique(dropna=True) > 1]
+        
+            # 2. Interaktionen (z.B. "Cultivar:Media")
+            interactions = []
+            if permanova_interaction_input:
+                for term in [t.strip() for t in permanova_interaction_input.split(",") if t.strip()]:
+                    cols = [c.strip() for c in term.split(":")]
+                    if len(cols) >= 2 and all(c in meta_rel.columns for c in cols):
+                        interactions.append(term)
+        
+            # 3. Strata (Blocking-Faktor)
+            strata_vec = meta_rel[permanova_selected_strata] if permanova_selected_strata in meta_rel.columns else None
+        
+            # 4. Wenn nichts → Warnung
+            if not factors and not interactions:
+                permanova_res = html.Div(
+                    [
+                        html.H4("PERMANOVA: Keine gültigen Faktoren", style={"color": "#e74c3c"}),
+                        html.P("Wähle mindestens einen Faktor mit ≥2 Gruppen (z.B. Substrate, Cultivar)."),
+                    ],
+                    style={
+                        "border": "3px solid #e74c3c",
+                        "padding": "18px",
+                        "borderRadius": "10px",
+                        "background": "#fadbd8",
+                        "fontSize": "1.1em",
+                    },
                 )
-                strata_vec = meta_rel[run_col] if run_col is not None else None
-
-                # ---------------------------
-                # Dynamically select interactions
-                # ---------------------------
-                factors = mf_terms  # main effects to include
-
-                # Candidate interactions to consider
-                candidate_pairs = [
-                    ("Cultivar", "Media"),
-                    ("Media", "Cultivation_Unit"),
-                    ("Media", "TIME_D"),
-                    ("Substrate", "Media"),
-                ]
-
-                # Keep only estimable interactions given the actual data
-                interactions = [
-                    f"{a}:{b}" for a, b in candidate_pairs
-                    if valid_interaction(meta_rel, a, b)
-                ]
-
-                print("Included factors:", factors)
-                print("Included interactions:", interactions)
-
-                # Run PERMANOVA
+        
+            else:
+                logger.info(f"PERMANOVA: {factors} | {interactions} | Strata: {permanova_selected_strata}")
+        
+                # --- Multifaktor-PERMANOVA ---
                 mf_res = permanova_marginal(
-                    distance_matrix=pd.DataFrame(
-                        dm_ait.data, index=dm_ait.ids, columns=dm_ait.ids
-                    ),
+                    distance_matrix=pd.DataFrame(dm_ait.data, index=dm_ait.ids, columns=dm_ait.ids),
                     metadata_df=meta_rel,
                     factors=factors,
                     interactions=interactions,
-                    permutations=999,
+                    permutations=permanova_num_permutations or 999,
                     strata=strata_vec,
                     random_state=42,
-                    level_map=None,
                 )
-
-                # Save PERMANOVA table
-                permanova_csv_path = os.path.join(
-                    out_dir, "permanova_multifactor_results.csv"
-                )
-                mf_res.to_csv(permanova_csv_path, index=False)
-
-                # R² bar plot
-                r2_fig = px.bar(
-                    mf_res.sort_values("R2", ascending=False),
-                    x="term",
-                    y="R2",
-                    text="R2",
-                    title="PERMANOVA (Multifactor) – R² by factor (marginal)",
-                )
-                r2_fig.update_traces(
-                    texttemplate="%{text:.3f}",
-                    textposition="outside",
-                    cliponaxis=False,
-                )
-                r2_fig.update_layout(
-                    margin=dict(l=40, r=30, t=60, b=100),
-                    yaxis_title="Proportion of variance (R²)",
-                    xaxis_title="Factor",
-                    showlegend=False,
-                    height=420,
-                )
-                apply_pub_style(r2_fig, portrait=True, base_font=16)
-                r2_graph = dcc.Graph(figure=r2_fig)
-
-                # PERMDISP (homogeneity of dispersion) – only for factors
-                # that still have >=2 groups
-                permdisp_rows = []
-                for col in [
-                    c for c in ["Substrate", "Media", "Cultivar", "Cultivation_Unit"]
-                    if c in meta_rel.columns and meta_rel[c].nunique(dropna=True) > 1
-                ]:
+        
+                csv_path = os.path.join(out_dir, "permanova_results.csv")
+                mf_res.to_csv(csv_path, index=False)
+        
+                # --- Fall 1: keine brauchbaren Ergebnisse ---
+                if mf_res.empty or not {"term", "R2"}.issubset(mf_res.columns):
+                    permanova_res = html.Div(
+                        [
+                            html.H4("Multifactor PERMANOVA"),
+                            html.P("No testable terms (all factors had a single level or were dropped)."),
+                        ],
+                        style={"color": "#666"},
+                    )
+        
+                # --- Fall 2: normale Ergebnisse ---
+                else:
+                    # ---------- R²-Barplot ----------
+                    r2_data = mf_res[["term", "R2"]].copy()
+                    r2_data["term"] = r2_data["term"].str.replace(":", " × ")
+        
+                    r2_fig = px.bar(
+                        r2_data,
+                        x="term",
+                        y="R2",
+                        title="explained variance (R²)",
+                        color="R2",
+                        color_continuous_scale="Blues",
+                        text="R2",
+                    )
+                    r2_fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+                    r2_fig.update_layout(showlegend=False, height=380)
+                    apply_pub_style(r2_fig)
+        
+                    # ---------- PERMDISP pro Faktor ----------
                     try:
-                        disp_tbl, group_means = betadisper_anova(
-                            pd.DataFrame(dm_ait.data, index=dm_ait.ids, columns=dm_ait.ids),
-                            meta_rel[col],
-                        )
-                        F_val = float(
-                            disp_tbl.loc[disp_tbl["stat"] == "F", "value"].values[0]
-                        )
-                        p_val = float(
-                            disp_tbl.loc[disp_tbl["stat"] == "p_value", "value"].values[0]
-                        )
-                        permdisp_rows.append(
-                            {"Factor": col, "F": F_val, "p_value": p_val}
-                        )
-                    except Exception as e_disp:
-                        logger.warning(f"Dispersion check failed for {col}: {e_disp}")
-
-                permdisp_df = pd.DataFrame(permdisp_rows)
-                permdisp_csv_path = os.path.join(out_dir, "permdisp_results.csv")
-                permdisp_df.to_csv(permdisp_csv_path, index=False)
-
-                # Tables
-                permanova_table = dash_table.DataTable(
-                    data=(
-                        mf_res[["term", "Df", "R2", "F", "p_value"]]
-                        .rename(
-                            columns={
-                                "term": "Factor",
-                                "Df": "Df",
-                                "R2": "R²",
-                                "F": "F",
-                                "p_value": "p-value",
-                            }
-                        )
+                        from skbio.stats.distance import DistanceMatrix, permdisp
+        
+                        dm_sk = DistanceMatrix(dm_ait.data, ids=dm_ait.ids)
+                        disp_texts = []
+                        for factor in factors:
+                            try:
+                                if factor not in meta_rel.columns or meta_rel[factor].nunique(dropna=True) < 2:
+                                    disp_texts.append(f"{factor}: not testable (only one level)")
+                                    continue
+        
+                                disp = permdisp(dm_sk, meta_rel[factor].astype(str))
+                                disp_texts.append(
+                                    f"{factor}: F = {disp['test statistic']:.2f}, p = {disp['p-value']:.3f}"
+                                )
+                            except Exception as e_disp:
+                                disp_texts.append(f"{factor}: failed ({e_disp})")
+        
+                        if disp_texts:
+                            disp_text = " | ".join(disp_texts)
+                        else:
+                            disp_text = "PERMDISP not computed (no valid factors)"
+        
+                    except Exception:
+                        disp_text = "PERMDISP nicht berechnet"
+        
+                    # ---------- Tabelle ----------
+                    table = dash_table.DataTable(
+                        data=mf_res[["term", "Df", "R2", "F", "p_value"]]
+                        .rename(columns={"term": "Faktor", "R2": "R²", "p_value": "p"})
                         .round(4)
-                        .to_dict("records")
-                    ),
-                    columns=[
-                        {"name": c, "id": c}
-                        for c in ["Factor", "Df", "R²", "F", "p-value"]
-                    ],
-                    sort_action="native",
-                    filter_action="native",
-                    style_table={"overflowX": "auto"},
-                    style_cell={"padding": "6px", "fontSize": 14},
-                    style_header={"fontWeight": "bold"},
-                )
+                        .to_dict("records"),
+                        columns=[{"name": i, "id": i} for i in ["Faktor", "Df", "R²", "F", "p"]],
+                        style_header={
+                            "backgroundColor": "#2c3e50",
+                            "color": "white",
+                            "fontWeight": "bold",
+                        },
+                        style_cell={"padding": "10px"},
+                        sort_action="native",
+                    )
+        
+                    permanova_res = html.Div(
+                        [
+                            html.H4("Multifactor PERMANOVA", style={"color": "#27ae60"}),
+                            html.P(f"factors: {', '.join(factors or ['–'])}"),
+                            html.P(f"interactions: {', '.join(interactions) if interactions else '–'}"),
+                            table,
+                            html.Br(),
+                            dcc.Graph(figure=r2_fig),
+                            html.H5("PERMDISP (per factor)"),
+                            html.P(
+                                disp_text,
+                                style={
+                                    "background": "#ecf0f1",
+                                    "padding": "8px",
+                                    "fontFamily": "monospace",
+                                },
+                            ),
+                            html.P(
+                                "permanova_results.csv",
+                                style={"color": "#27ae60", "fontWeight": "bold"},
+                            ),
+                        ]
+                    )
+        
+        except Exception as e:
+            logger.error(f"PERMANOVA Fehler: {e}", exc_info=True)
+            permanova_res = html.Div(
+                [
+                    html.H4("PERMANOVA Fehler", style={"color": "#c0392b"}),
+                    html.Pre(str(e)[:300]),
+                ],
+                style={
+                    "border": "2px solid #c0392b",
+                    "padding": "15px",
+                    "background": "#fadbd8",
+                },
+            )
 
-                permdisp_table = dash_table.DataTable(
-                    data=permdisp_df.round(4).to_dict("records"),
-                    columns=[{"name": c, "id": c} for c in permdisp_df.columns],
-                    sort_action="native",
-                    filter_action="native",
-                    style_table={"overflowX": "auto"},
-                    style_cell={"padding": "6px", "fontSize": 14},
-                    style_header={"fontWeight": "bold"},
-                )
-
-                permanova_res = html.Div(
-                    [
-                        html.H4(
-                            "Multifactor PERMANOVA "
-                            "(marginal tests; each factor controlled for others)"
-                        ),
-                        html.P(
-                            "Terms included: "
-                            + ", ".join(factors + interactions)
-                            + (
-                                f" | Permutations stratified by '{run_col}'."
-                                if run_col
-                                else ""
-                            )
-                        ),
-                        html.H5("PERMANOVA results"),
-                        permanova_table,
-                        html.Br(),
-                        r2_graph,
-                        html.H5("Dispersion check (PERMDISP)"),
-                        permdisp_table,
-                        html.Div(
-                            [
-                                html.P("Saved to:"),
-                                html.Ul(
-                                    [
-                                        html.Li(
-                                            html.Code(
-                                                os.path.basename(permanova_csv_path)
-                                            )
-                                        ),
-                                        html.Li(
-                                            html.Code(
-                                                os.path.basename(permdisp_csv_path)
-                                            )
-                                        ),
-                                    ]
-                                ),
-                            ],
-                            style={"marginTop": "10px", "color": "#555"},
-                        ),
-                    ],
-                    style={
-                        "border": "1px solid #ddd",
-                        "padding": "10px",
-                        "borderRadius": "8px",
-                        "marginTop": "10px",
-                    },
-                )
-            else:
-                permanova_res = html.Div(
-                    [
-                        html.H4("Multifactor PERMANOVA"),
-                        html.P(
-                            "Skipped: fewer than two factors with >1 level "
-                            "available in metadata."
-                        ),
-                    ],
-                    style={"color": "#666"},
-                )
-        except Exception as e_perm:
-            logger.error(f"PERMANOVA/PERMDISP failed: {e_perm}", exc_info=True)
-            # keep permanova_res as default or replace with an error div if you want
-            pass
-
-
-
-
-    
-
-        # ---- NMDS ----
+               # ---- NMDS ----
         nmds_scores, nmds_stress = (None, None)
+        nmds_fig = go.Figure()
+
         try:
             nmds_scores, nmds_stress = perform_nmds(dm)
         except Exception as e_nmds:
             logger.warning(f"NMDS failed: {e_nmds}")
 
         if nmds_scores is not None:
-            nmds_plot_df = nmds_scores.join(ps1['meta'][[treat_col]])
+            nmds_plot_df = nmds_scores.copy()
+            if treat_col in nmds_plot_df.columns:
+                nmds_plot_df[treat_col] = nmds_plot_df[treat_col].astype(str)
+            else:
+                nmds_plot_df = nmds_plot_df.join(ps1['meta'][[treat_col]].astype(str))
+
             nmds_plot_df[treat_col] = pd.Categorical(
                 nmds_plot_df[treat_col], categories=group_order, ordered=True
             )
+            nmds_plot_df['GroupPretty'] = nmds_plot_df[treat_col].astype(str).map(pretty)
+
             nmds_fig = px.scatter(
-                nmds_plot_df, x='NMDS1', y='NMDS2', color=treat_col,
+                nmds_plot_df,
+                x='NMDS1', y='NMDS2',
+                color='GroupPretty',
                 title=f"NMDS (Stress: {nmds_stress:.4f})",
-                category_orders={treat_col: group_order},
-                color_discrete_sequence=palette_groups,
+                category_orders={'GroupPretty': present_order},
+                color_discrete_map=color_map_groups,
             )
             apply_pub_style(nmds_fig, portrait=True, base_font=16)
-        else:
-            nmds_fig = go.Figure(layout_title_text="NMDS Failed")
-            apply_pub_style(nmds_fig, portrait=True, base_font=16)
+        # else: keep default empty nmds_fig
+
+
 
         # ---- PCA ----
         pca_res, pca_var = perform_pca(ps1['asv'], int(top_asvs))
-        pca_df = (
-            pd.DataFrame(pca_res, columns=['PC1', 'PC2'], index=ps1['meta'].index)
-            .join(ps1['meta'][treat_col])
-        )
+        pca_df = pd.DataFrame(pca_res, columns=['PC1','PC2'], index=ps1['meta'].index)
+        if treat_col in pca_df.columns:
+            pca_df[treat_col] = pca_df[treat_col].astype(str)
+        else:
+            pca_df = pca_df.join(ps1['meta'][[treat_col]].astype(str))
         pca_df[treat_col] = pd.Categorical(pca_df[treat_col], categories=group_order, ordered=True)
+        pca_df['GroupPretty'] = pca_df[treat_col].astype(str).map(pretty)
+
         pca_fig = px.scatter(
-            pca_df, x='PC1', y='PC2', color=treat_col,
+            pca_df, x='PC1', y='PC2',
+            color='GroupPretty',
             title=f"PCA (Top {top_asvs} ASVs)",
             labels={
                 "PC1": f"PC1 ({pca_var[0]*100:.2f}%)",
                 "PC2": f"PC2 ({pca_var[1]*100:.2f}%)"
             },
-            category_orders={treat_col: group_order},
-            color_discrete_sequence=palette_groups,
+            category_orders={'GroupPretty': present_order},
+            color_discrete_map=color_map_groups,
         )
         apply_pub_style(pca_fig, portrait=True, base_font=16)
+
 
 
 
@@ -833,95 +965,117 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
         seq_depth_fig = px.histogram(seqtab.sum(axis=1), title="Sequencing Depth")
         apply_pub_style(seq_depth_fig, portrait=True, base_font=16)
         global_data['seq_depth_fig'] = seq_depth_fig
+        # Make a shallow copy of ps1 with a pretty column
+        # Make a shallow copy with pretty column
+        ps1_pretty = {
+            'asv': ps1['asv'],
+            'tax': ps1['tax'],
+            'meta': ps1['meta'].copy()
+        }
+        ps1_pretty['meta']['GroupPretty'] = ps1_pretty['meta'][treat_col].astype(str).map(pretty)
         
-
-            # Abundance plots (guard if functions don't accept group_order)
+        # Order-level abundance
         try:
-            abund_order_fig = plot_abundance_by_order(ps1, treat_col, group_order=group_order)
+            abund_order_fig = plot_abundance_by_order(ps1_pretty, 'GroupPretty', group_order=present_order)
         except TypeError:
-            abund_order_fig = plot_abundance_by_order(ps1, treat_col)
+            abund_order_fig = plot_abundance_by_order(ps1_pretty, 'GroupPretty')
         global_data['abundance_order_plot'] = abund_order_fig
     
+        # Genus-level abundance
         try:
-                abund_genus_fig = plot_abundance_by_taxlevel(
-                    ps1, treat_col, tax_level="Genus", threshold=0.01, group_order=group_order
-                )
+            abund_genus_fig = plot_abundance_by_taxlevel(
+                ps1_pretty, 'GroupPretty', tax_level="Genus", threshold=0.01, group_order=present_order
+            )
         except TypeError:
-                abund_genus_fig = plot_abundance_by_taxlevel(
-                    ps1, treat_col, tax_level="Genus", threshold=0.01
-                )
+            abund_genus_fig = plot_abundance_by_taxlevel(
+                ps1_pretty, 'GroupPretty', tax_level="Genus", threshold=0.01
+            )
+
         global_data['abundance_genus_plot'] = abund_genus_fig
     
-        ancom_df = pd.DataFrame()  # default empty
-    
+        # ---- Differential abundance + ANCOM heatmap ----
+        ancom_df = pd.DataFrame()
+        
+        # default empty heatmap (so the variable *always* exists)
+        ancom_heatmap_fig = go.Figure()
+        ancom_heatmap_fig.update_layout(
+            title="ANCOM heatmap (no significant features or ANCOM not selected)",
+            xaxis_title="Treatment",
+            yaxis_title="Feature",
+        )
+        apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
+        
         if da_method == 'ancom':
-                try:
-                    ancom_df = run_ancom_skbio(ps1, treat_col, alpha=0.05)
-    
-                    # robust: only filter if 'reject' exists and is True
-                    if 'reject' in ancom_df.columns:
-                        sig = ancom_df[ancom_df['reject'] == True].copy()
-                    else:
-                        sig = ancom_df.iloc[0:0].copy()
-    
-                    cols = ['Feature_ID', 'W', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
-                    cols = [c for c in cols if c in sig.columns]
-    
-                    diff_abund_res = html.Div([
-                        html.H4("ANCOM (scikit-bio) significant features (reject = True)"),
-                        html.P(f"Grouping: {treat_col} | alpha = 0.05 | correction = Holm–Bonferroni"),
-                        html.Table(
-                            [html.Thead(html.Tr([html.Th(c) for c in cols]))] +
-                            [html.Tbody([
-                                html.Tr([html.Td(sig.iloc[i][c]) for c in cols])
-                                for i in range(min(50, len(sig)))
-                            ])]
+            try:
+                ancom_df = run_ancom_skbio(ps1, treat_col, alpha=0.05)
+        
+                # robust: only filter if 'reject' exists and is True
+                if 'reject' in ancom_df.columns:
+                    sig = ancom_df[ancom_df['reject'] == True].copy()
+                else:
+                    sig = ancom_df.iloc[0:0].copy()
+        
+                cols = ['Feature_ID', 'W', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
+                cols = [c for c in cols if c in sig.columns]
+        
+                diff_abund_res = html.Div([
+                    html.H4("ANCOM (scikit-bio) significant features (reject = True)"),
+                    html.P(f"Grouping: {treat_col} | alpha = 0.05 | correction = Holm–Bonferroni"),
+                    html.Table(
+                        [html.Thead(html.Tr([html.Th(c) for c in cols]))] +
+                        [html.Tbody([
+                            html.Tr([html.Td(sig.iloc[i][c]) for c in cols])
+                            for i in range(min(50, len(sig)))
+                        ])]
+                    )
+                ])
+        
+                out_path = os.path.join(out_dir, 'ancom_results.csv')
+                ancom_df.to_csv(out_path, index=False)
+        
+                # ---- Heatmap: only if we actually have ANCOM results ----
+                if not ancom_df.empty:
+                    try:
+                        # plotting.py signature:
+                        # plot_ancom_clr_heatmap(ancom_df, top_k=None, clr_threshold=1.0, ...)
+                        ancom_heatmap_fig = plot_ancom_clr_heatmap(
+    ancom_df,
+    top_k=None,
+    clr_threshold=1.0,
+    w_threshold=1,
+    short_id_col='ASV',
+    label_with_genus=True,
+    group_order=group_order,   # raw group names
+    label_map=label_map,       
+)
+
+                    except TypeError:
+                        # fallback if your local version has no group_order argument
+                        ancom_heatmap_fig = plot_ancom_clr_heatmap(
+                            ancom_df,
+                            top_k=None,
+                            clr_threshold=1.0,
+                            w_threshold=1,
+                            short_id_col='ASV',
+                            label_with_genus=True,
+                            group_order=group_order,
+    label_map=label_map,
                         )
-                    ])
-    
-                    out_path = os.path.join(out_dir, 'ancom_results.csv')
-                    ancom_df.to_csv(out_path, index=False)
-    
-                except Exception as e_ancom:
-                    logger.error(f"ANCOM (skbio) failed: {e_ancom}", exc_info=True)
-                    diff_abund_res = html.Div([
-                        html.H4("ANCOM (Python) failed"),
-                        html.Pre(str(e_ancom), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
-                    ])
+                    apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
+        
+            except Exception as e_ancom:
+                logger.error(f"ANCOM (skbio) failed: {e_ancom}", exc_info=True)
+                diff_abund_res = html.Div([
+                    html.H4("ANCOM (Python) failed"),
+                    html.Pre(str(e_ancom), style={'whiteSpace': 'pre-wrap', 'color': '#b00'})
+                ])
+        
         else:
-                diff_abund_res = run_differential_abundance(ps1, treat_col)
-    
-            # ---- Heatmap (guarded) ----
-        if not ancom_df.empty:
-                try:
-                    ancom_heatmap_fig = plot_ancom_clr_heatmap(
-                        ancom_df,
-                        top_k=None,          # show ALL passing features
-                        clr_threshold=1.0,   # require CLR mean > 1 in ≥1 group
-                        w_threshold=1,       # require W > 1
-                        short_id_col='ASV',
-                        label_with_genus=True,
-                        group_order=group_order,  # only used if function supports it
-                    )
-                except TypeError:
-                    # older signature without group_order
-                    ancom_heatmap_fig = plot_ancom_clr_heatmap(
-                        ancom_df,
-                        top_k=None,
-                        clr_threshold=1.0,
-                        w_threshold=1,
-                        short_id_col='ASV',
-                        label_with_genus=True,
-                    )
-                apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
-        else:
-                ancom_heatmap_fig = go.Figure()
-                ancom_heatmap_fig.update_layout(
-                    title="ANCOM heatmap (run with DA method = 'ANCOM' to populate)",
-                    xaxis_title="Treatment",
-                    yaxis_title="Feature",
-                )
-                apply_pub_style(ancom_heatmap_fig, portrait=True, base_font=16)
+            # Kruskal–Wallis (current implementation)
+            diff_abund_res = run_differential_abundance(ps1, treat_col)
+            # ancom_heatmap_fig stays as the default empty figure defined above
+
+
     # ---------------- Indicator species & tree (robust) ----------------
         indic_spec_res = html.Div([html.H4("Indicator species"), html.P("No results computed.")])
         indic_df = pd.DataFrame()
@@ -1046,20 +1200,21 @@ def run_full_analysis(n_clicks, analysis_mode, data_path, out_dir, trunc_f, trun
                 error_msg   # 17 output-files.children
             )
     
-    @app.callback(
-    Output('download-report', 'data'),
-    Input('download-report-button', 'n_clicks'),
+@app.callback(
+Output('download-report', 'data'),
+Input('download-report-button', 'n_clicks'),
     State('output-dir', 'value'),
     State('ai-interpretations', 'children'),
     prevent_initial_call=True
 )
-    def download_pdf_report(n_clicks, output_dir, interpretations_md):
-     if n_clicks > 0:
-        interpretations = interpretations_md or "No interpretation generated."
-        report_path = generate_pdf_report(global_data, interpretations, output_dir)
-        if report_path:
-            return dcc.send_file(report_path)
-    return None
+def download_pdf_report(n_clicks, output_dir, interpretations_md):
+        if n_clicks > 0:
+            interpretations = interpretations_md or "No interpretation generated."
+            report_path = generate_pdf_report(global_data, interpretations, output_dir)
+            if report_path:
+                return dcc.send_file(report_path)
+        return None
+
 
 
 @app.callback(

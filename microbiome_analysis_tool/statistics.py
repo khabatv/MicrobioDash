@@ -152,16 +152,14 @@ def _design_from_formula(metadata_df, factors, interactions=None, level_map=None
 
     # Combine main effects and interaction terms into RHS
     rhs_terms = list(factors) + list(interactions)
-    rhs = " + ".join(rhs_terms)  # e.g. "Cultivar + Media + Cultivar:Media"
+    rhs = " + ".join(rhs_terms)
+   # Let patsy include the intercept
+    formula = rhs               
 
-    # '0 +' → no intercept; we handle intercept in _proj_hat
-    formula = "0 + " + rhs
-
-    # Design matrix only (no Y)
     X = patsy.dmatrix(formula, metadata_df, return_type="dataframe")
 
-    # term_name_slices maps each term to the columns for that term
     term_slices = X.design_info.term_name_slices
+   # Keep df per term, but we will ignore 'Intercept' later
     df_per_term = {term: sl.stop - sl.start for term, sl in term_slices.items()}
 
     return X.to_numpy(), df_per_term, term_slices
@@ -183,41 +181,16 @@ def permanova_marginal(
 ):
     """
     Multifactor PERMANOVA with marginal (Type III-like) tests via Freedman–Lane permutations.
-
-    Parameters
-    ----------
-    distance_matrix : (n x n) numpy.ndarray or pandas.DataFrame
-        Symmetric pairwise distance matrix. If DataFrame, index/columns should be sample IDs.
-    metadata_df : pandas.DataFrame
-        Rows indexed by sample IDs (will be aligned to distance if DataFrame was passed).
-    factors : list[str]
-        Column names in metadata_df to include in the model (main effects).
-    interactions : list[str], optional
-        Interaction terms in patsy syntax, e.g. ["Cultivar:Media", "Media:Cultivation_Unit"].
-    permutations : int, default 999
-        Number of permutations for p-values.
-    strata : array-like or pandas Series, optional
-        Blocking factor; permutations are restricted within levels of 'strata'.
-    random_state : int or np.random.Generator, optional
-        Seed or RNG for reproducibility.
-    level_map : dict[str, list], optional
-        (kept for compatibility; not used directly here)
-
-    Returns
-    -------
-    pandas.DataFrame with columns:
-        term, Df, SS, R2, F, p_value
-        (sorted by R2 descending)
+    Returns a DataFrame with columns: term, Df, SS, R2, F, p_value.
     """
-    # Align inputs (same as before)
+    # -------- Align inputs --------
     D, metadata_df = _ensure_numpy_distance(distance_matrix, metadata_df)
     if metadata_df is None:
         raise ValueError("metadata_df must be provided when passing a numpy distance matrix.")
 
-    # Drop rows with NA in any factor or interaction variables
+    # Terms (main + interaction factors) for NA-dropping
     all_terms = list(factors)
     if interactions:
-        # extract base factors from interaction strings, e.g. "A:B" -> ["A", "B"]
         for inter in interactions:
             for part in inter.split(":"):
                 if part not in all_terms:
@@ -231,22 +204,24 @@ def permanova_marginal(
     if n != len(metadata_df):
         raise ValueError("Distance matrix and metadata row counts do not match after NA dropping.")
 
-    # Build design matrix with patsy (no intercept; _proj_hat adds the intercept)
+    # -------- Design matrix (WITH intercept handled by patsy) --------
     X_full, df_per_term, term_slices = _design_from_formula(
         metadata_df=metadata_df,
         factors=factors,
         interactions=interactions or [],
         level_map=level_map,
     )
-
+    # X_full already includes "Intercept"
     if X_full.shape[1] == 0:
         raise ValueError("All factors collapsed (single level). No testable terms.")
 
-    # Gower-centered distance matrix
+    # -------- Gower-centered distance --------
     G = _gower_center(D)
     SS_tot = np.trace(G)
 
-    # Projection for full model
+    from numpy.linalg import matrix_rank
+
+    # Projection matrices
     H_full = _proj_hat(X_full)
     I = np.eye(n)
 
@@ -254,16 +229,15 @@ def permanova_marginal(
     E_full = (I - H_full) @ G @ (I - H_full)
     SSE_full = np.trace(E_full)
 
-    # Residual df: n - rank(X_full with intercept)
-    X_with_int = np.column_stack([np.ones((n, 1)), X_full])
-    rank_full = np.linalg.matrix_rank(X_with_int)
+    # Residual df: n - rank(X_full)  (intercept is inside X_full)
+    rank_full = matrix_rank(X_full)
     df_resid = n - rank_full
     if df_resid < 1:
         raise ValueError("Residual degrees of freedom < 1. Model is saturated.")
 
     rng = np.random.default_rng(random_state)
 
-    # Prepare strata if provided
+    # -------- Strata handling --------
     strata_series = None
     if strata is not None:
         if isinstance(strata, (pd.Series, pd.Categorical)):
@@ -277,11 +251,14 @@ def permanova_marginal(
 
     results = []
 
-    # For each term, compute marginal effect via reduced vs full model
-    # Note: term names include interactions (e.g. "Cultivar:Media") from _design_from_formula
+    # -------- Loop over terms (skip intercept) --------
     for term, sl in term_slices.items():
+        if term == "Intercept":
+            continue
+
         p_term = df_per_term.get(term, 0)
         if p_term == 0:
+            # still record it, but with 0 SS
             results.append(
                 {
                     "term": term,
@@ -294,24 +271,16 @@ def permanova_marginal(
             )
             continue
 
-        # Reduced design: drop columns corresponding to this term
+        # Reduced design: drop this term's columns
         cols_keep = np.ones(X_full.shape[1], dtype=bool)
         cols_keep[sl] = False
-        X_red = X_full[:, cols_keep] if cols_keep.any() else np.zeros((n, 0))
+        X_red = X_full[:, cols_keep] if cols_keep.any() else np.ones((n, 1))
 
-        if X_red.shape[1] > 0:
-            H_red = _proj_hat(X_red)
-            E_red = (I - H_red) @ G @ (I - H_red)
-            SSE_red = np.trace(E_red)
-        else:
-            # Reduced model with only intercept
-            H_red = np.ones((n, n)) / n
-            E_red = (I - H_red) @ G @ (I - H_red)
-            SSE_red = np.trace(E_red)
+        H_red = _proj_hat(X_red)
+        E_red = (I - H_red) @ G @ (I - H_red)
+        SSE_red = np.trace(E_red)
 
-        # Partial SS for this term
         SS_term = SSE_red - SSE_full
-        # Numerical safety: tiny negative values -> 0
         if SS_term < 0 and abs(SS_term) < 1e-10 * SS_tot:
             SS_term = 0.0
 
@@ -320,9 +289,8 @@ def permanova_marginal(
         F_obs = MS_term / MS_res if (MS_res is not None and MS_res > 0) else np.inf
         R2 = SS_term / SS_tot if SS_tot > 0 else np.nan
 
-        # Freedman–Lane permutations under reduced model
-        # Residualized G under reduced model
-        R = (I - H_red) @ G @ (I - H_red)
+        # ---- Freedman–Lane permutations ----
+        R = (I - H_red) @ G @ (I - H_red)  # residual G under reduced model
 
         eigvals, eigvecs = np.linalg.eigh(R)
         pos = eigvals > 1e-12
@@ -330,7 +298,6 @@ def permanova_marginal(
             p_value = 1.0
         else:
             U = eigvecs[:, pos] * np.sqrt(eigvals[pos])
-
             exceed = 0
             for _ in range(permutations):
                 if strata_series is None:
@@ -341,19 +308,13 @@ def permanova_marginal(
                 U_perm = U[perm, :]
                 G_star = U_perm @ U_perm.T
 
-                # Permuted G under the alternative (following Freedman–Lane idea)
                 G_perm = H_red @ G @ H_red + (I - H_red) @ G_star @ (I - H_red)
 
-                # Recompute SSE for reduced and full models on permuted G
                 E_full_p = (I - H_full) @ G_perm @ (I - H_full)
                 SSE_full_p = np.trace(E_full_p)
 
-                if X_red.shape[1] > 0:
-                    E_red_p = (I - H_red) @ G_perm @ (I - H_red)
-                    SSE_red_p = np.trace(E_red_p)
-                else:
-                    E_red_p = (I - H_red) @ G_perm @ (I - H_red)
-                    SSE_red_p = np.trace(E_red_p)
+                E_red_p = (I - H_red) @ G_perm @ (I - H_red)
+                SSE_red_p = np.trace(E_red_p)
 
                 SS_term_p = SSE_red_p - SSE_full_p
                 if SS_term_p < 0 and abs(SS_term_p) < 1e-10 * SS_tot:
@@ -379,8 +340,11 @@ def permanova_marginal(
             }
         )
 
-    out = pd.DataFrame(results).sort_values("R2", ascending=False).reset_index(drop=True)
+    out = pd.DataFrame(results, columns=["term", "Df", "SS", "R2", "F", "p_value"])
+    if not out.empty and "R2" in out.columns:
+        out = out.sort_values("R2", ascending=False).reset_index(drop=True)
     return out
+
 
 # ------------------------------
 

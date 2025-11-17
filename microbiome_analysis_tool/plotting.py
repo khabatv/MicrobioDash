@@ -17,11 +17,10 @@ from dash import html
 from .config import logger
 # ---------- Publication style helpers ----------
 from plotly.colors import qualitative as qual
-
+from typing import Optional, List, Dict, Tuple
 import plotly.colors as pc
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import numpy as np
 
 def get_pub_palette(n: int) -> list:
     """
@@ -113,12 +112,94 @@ def _infer_group_order_from_meta(meta_df: pd.DataFrame, treat_col: str):
             except Exception:
                 pass
 
-    # 3) fallback: first-seen order in metadata
-    return list(pd.unique(s))
-def consistent_color_mapping(labels):
-    unique_labels = sorted(set(labels))
-    palette = get_pub_palette(len(unique_labels))
-    return dict(zip(unique_labels, palette))
+    # 3) fallback
+    return sorted(pd.unique(s.astype(str)))
+def consistent_color_mapping(labels, order=None):
+    """
+    Return a {label: color} map.
+    - If `order` is given, use that exact order.
+    - Else, preserve first-seen order in `labels` (not alphabetical).
+    """
+    if order is None:
+        # preserve appearance order, not sorted()
+        unique = list(dict.fromkeys(list(labels)))
+    else:
+        unique = list(order)
+
+    palette = get_pub_palette(len(unique))
+    return dict(zip(unique, palette))
+def _compact_label(x: str) -> str:
+    """
+    Creates a shortened, human-readable label from treatment IDs.
+    Example: 'UC_PET_2_50%_Brine_Plate_T' → 'U. compressa · PET · 50% Brine · Plate'
+    """
+    # Simplify frequent patterns
+    x = x.replace("_1/UCM", " · UCM")
+    x = x.replace("_1/TM", " · TM")
+    x = x.replace("_2/50% Brine", " · 50% Brine")
+    x = x.replace("_3/Brine", " · Brine")
+    x = x.replace("_Brine", " · Brine")
+    x = x.replace("_Plate_T", " · Plate")
+    x = x.replace("_Plate_S", " · Plate")
+    x = x.replace("_Tank_T", " · Tank")
+
+    # Replace remaining underscores with spaces
+    x = x.replace("_", " ")
+
+    return x.strip()
+
+def _apply_labels_and_order(
+    df: pd.DataFrame,
+    col: str,
+    meta: pd.DataFrame,
+    order_mode: str = "meta",                 # "meta" | "alpha" | "first" | "custom"
+    custom_order: Optional[List[str]] = None,
+    label_map: Optional[Dict[str, str]] = None,  # {"old": "Pretty", ...}
+    auto_compact: bool = True
+):
+    """
+    Unifies order + label handling for all plots.
+    - Renames values in `col` using label_map (if given) and/or _compact_label().
+    - Computes present_order based on order_mode.
+    Returns: (df2, present_order, label_map_used)
+    """
+    df2 = df.copy()
+
+    # --- determine base order from metadata (ordered categorical wins) ---
+    if col in meta.columns:
+        s = meta[col]
+        if pd.api.types.is_categorical_dtype(s) and getattr(s.cat, "ordered", False):
+            meta_order = list(s.cat.categories)
+        else:
+            meta_order = list(dict.fromkeys(s.astype(str).tolist()))
+    else:
+        meta_order = []
+
+    vals = df2[col].astype(str)
+    if order_mode == "alpha":
+        present_order = sorted(vals.unique().tolist())
+    elif order_mode == "first":
+        present_order = list(dict.fromkeys(vals.tolist()))
+    elif order_mode == "custom" and custom_order:
+        present_order = [x for x in custom_order if x in vals.unique()]
+    else:  # "meta" default
+        present_order = [g for g in meta_order if g in vals.unique()]
+        if not present_order:
+            present_order = sorted(vals.unique().tolist())
+
+    # --- build unified label map ---
+    label_map_used: Dict[str, str] = {}
+    for v in vals.unique():
+        pretty = label_map[v] if (label_map and v in label_map) else v
+        if auto_compact:
+            pretty = _compact_label(pretty)
+        label_map_used[v] = pretty
+
+    df2[col] = vals.map(lambda x: label_map_used.get(x, x))
+    present_order = [label_map_used.get(x, x) for x in present_order if x in label_map_used]
+
+    return df2, present_order, label_map_used
+
 
 # -----------------------------------------------------------------------------
 def add_stat_annotations(fig, alpha_df, treatment_col, stats_df, group_order=None):
@@ -217,7 +298,6 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01, group_
         tax_df    = ps1_object['tax']  # taxonomy (index = ASV)
         meta      = ps1_object['meta'] # metadata (index = SampleID)
 
-        # Long format with Order and treatment
         melted_df = (
             asv_table
             .stack()
@@ -228,12 +308,10 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01, group_
         )
         melted_df['Order'] = melted_df['Order'].fillna('Unassigned')
 
-        # Sum per treatment × Order, then compute relative abundance per treatment
         grp = melted_df.groupby([treatment_column, 'Order'])['Abundance'].sum().reset_index()
         totals = grp.groupby(treatment_column)['Abundance'].transform('sum')
         grp['RelativeAbundance'] = grp['Abundance'] / totals
 
-        # Collapse rare Orders to 'Other'
         mean_by_order = grp.groupby('Order')['RelativeAbundance'].mean()
         rare_orders = mean_by_order[mean_by_order < threshold].index
         grp['Order'] = grp['Order'].where(~grp['Order'].isin(rare_orders), 'Other')
@@ -243,7 +321,7 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01, group_
                .sum().reset_index()
         )
 
-        # Category order for x-axis
+        # x-axis order ("present")
         if group_order:
             present = [g for g in group_order if g in final_df[treatment_column].unique()]
         else:
@@ -253,20 +331,29 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01, group_
             else:
                 present = list(dict.fromkeys(final_df[treatment_column].astype(str).tolist()))
 
-        # ✅ consistent colors per Order
-        color_map = consistent_color_mapping(final_df['Order'])
+        # decide stack/legend order by global mean abundance
+        mean_by_order2 = final_df.groupby('Order')['RelativeAbundance'].mean().sort_values(ascending=False)
+        order_order = mean_by_order2.index.tolist()
+        if "Other" in order_order:
+            order_order = [x for x in order_order if x != "Other"] + ["Other"]
+
+        color_map = consistent_color_mapping(final_df['Order'], order=order_order)
 
         fig = px.bar(
             final_df,
             x=treatment_column,
             y='RelativeAbundance',
             color='Order',
-            category_orders={treatment_column: present},
+            category_orders={
+                treatment_column: present,
+                'Order': order_order
+            },
             color_discrete_map=color_map,
             title=f"Mean Relative Abundance by Order (>{threshold*100:.0f}%)",
             height=700
         )
         fig.update_layout(
+            legend_traceorder="reversed",  # legend matches stack top→bottom
             xaxis_title=treatment_column,
             yaxis_title="Mean Relative Abundance",
             yaxis_tickformat='.0%'
@@ -276,6 +363,7 @@ def plot_abundance_by_order(ps1_object, treatment_column, threshold=0.01, group_
     except Exception as e:
         logger.error(f"Could not generate Order-level abundance plot: {e}", exc_info=True)
         return go.Figure(layout_title_text=f"Error: {e}")
+
 
 
 def plot_abundance_by_taxlevel(ps1_object, treatment_column, tax_level="Genus", threshold=0.01, group_order=None):
@@ -324,25 +412,33 @@ def plot_abundance_by_taxlevel(ps1_object, treatment_column, tax_level="Genus", 
             else:
                 present = list(dict.fromkeys(final_df[treatment_column].astype(str).tolist()))
 
-        # Palette: one color per displayed taxon
-        n_colors = final_df[tax_level].nunique()
-        palette  = get_pub_palette(n_colors)
-        color_map = consistent_color_mapping(final_df[tax_level])
+               # ---------- NEW: decide stack/legend order by global mean abundance ----------
+        mean_by_tax2 = (
+    final_df.groupby(tax_level)['RelativeAbundance']
+            .mean()
+            .sort_values(ascending=False)
+)
+        tax_order = mean_by_tax2.index.tolist()
+        if "Other" in tax_order:
+            tax_order = [x for x in tax_order if x != "Other"] + ["Other"]
+        
+        color_map = consistent_color_mapping(final_df[tax_level], order=tax_order)
+
         fig = px.bar(
             final_df,
             x=treatment_column,
             y='RelativeAbundance',
             color=tax_level,
-            category_orders={treatment_column: present},
+            category_orders={
+                treatment_column: present,
+                tax_level: tax_order                     # <- controls trace stacking order
+            },
             color_discrete_map=color_map,
             title=f"Mean Relative Abundance by {tax_level} (>{threshold*100:.0f}%)",
             height=700
         )
-        fig.update_layout(
-            xaxis_title=treatment_column,
-            yaxis_title="Mean Relative Abundance",
-            yaxis_tickformat='.0%'
-        )
+        fig.update_layout(legend_traceorder="reversed")
+
         apply_pub_style(fig, portrait=True, base_font=16)
         return fig
     except Exception as e:
@@ -358,8 +454,10 @@ def plot_ancom_clr_heatmap(
     short_id_col='ASV',
     max_id_len=12,
     label_with_genus=True,
-    group_order=None,  # <- NEW: order groups/columns
+    group_order=None,          # order of *raw* groups
+    label_map=None,            # {"raw_name": "Pretty label"}
 ):
+
     import numpy as np
     import pandas as pd
     import plotly.express as px
@@ -423,13 +521,36 @@ def plot_ancom_clr_heatmap(
 
     # build wide matrix with desired column order
     wide = df_filt.set_index('TaxLabel')[clr_cols].copy()
+    # raw group names, e.g. "UC_PET_2/50%_Brine_Plate_T"
     wide.columns = [c.replace('CLR_mean::', '') for c in clr_cols]
-
+    
+    # --- apply pretty labels on columns, if provided ---
+    if label_map is not None:
+        rename_dict = {g: label_map.get(g, g) for g in wide.columns}
+        wide = wide.rename(columns=rename_dict)
+    
+    # --- optional column ordering based on group_order ---
+    if group_order is not None:
+        if label_map is not None:
+            # order by PRETTY names, but using the raw group_order
+            pretty_order = [
+                label_map.get(g, g)
+                for g in group_order
+                if label_map.get(g, g) in wide.columns
+            ]
+        else:
+            pretty_order = [g for g in group_order if g in wide.columns]
+    
+        if pretty_order:
+            wide = wide[pretty_order]
+    
     # optional row ordering: by column of max CLR
     try:
         wide = wide.loc[wide.apply(np.argmax, axis=1).sort_values().index]
     except Exception:
         pass
+
+
 
     fig = px.imshow(
         wide,
